@@ -28,4 +28,4 @@ COPY . .
 # -w 4: 워커 프로세스 4개 (CPU 코어 수 * 2 + 1 권장)
 # -k uvicorn.workers.UvicornWorker: Uvicorn 워커 사용
 # --timeout 120: 그래프 생성 시간이 길 수 있으므로 타임아웃 넉넉히 설정
-CMD ["gunicorn", "main:app", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]s
+CMD ["gunicorn", "main:app", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
