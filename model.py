@@ -572,12 +572,8 @@ def run_cli(
     hour: Any = HOUR_DEFAULT,
     out_json: str = OUT_JSON,
     out_html: str = OUT_HTML,
-    visualize: bool = True,
+    visualize: bool = False,
 ) -> PipelineResult:
-    """
-    코드 내부에서 바로 호출할 수 있는 진입점.
-    예) run_cli(START_LAT=..., START_LON=..., END_LAT=..., END_LON=..., model="edge_pref_model.json")
-    """
     if not model:
         raise FileNotFoundError("모델 경로(model)가 비었습니다.")
 
@@ -622,18 +618,17 @@ def run_cli(
 
 
 if __name__ == "__main__":
-    # 아래 값들만 수정해도 바로 실행 흐름을 제어할 수 있습니다.
     MAIN_START_LAT = START_LAT
     MAIN_START_LON = START_LON
     MAIN_END_LAT = END_LAT
     MAIN_END_LON = END_LON
-    MAIN_MODEL = MODEL_PATH          # 필수: 모델 가중치 경로
+    MAIN_MODEL = MODEL_PATH         
     MAIN_OUT_JSON = OUT_JSON
     MAIN_OUT_HTML = OUT_HTML
     MAIN_ALPHA = ALPHA
     MAIN_HOUR = HOUR_DEFAULT
     MAIN_MARGIN_M = MARGIN_M
-    MAIN_VISUALIZE = True
+    MAIN_VISUALIZE = False
 
     run_cli(
         start_lat=MAIN_START_LAT,
