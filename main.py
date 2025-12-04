@@ -15,6 +15,7 @@ from decimal import Decimal
 from auth import get_current_user_sub
 from database import get_db, User
 from model import run_pipeline, PipelineResult
+import uuid
 
 dynamodb = boto3.resource('dynamodb', region_name='us-west-2')
 route_table = dynamodb.Table('inha-capstone-11-nosql')
@@ -79,6 +80,7 @@ def calculate_route(
         # 5. DynamoDB에 저장
         # Partition Key: user_id, Sort Key: timestamp (추천 스키마)
         item = {
+            "route_id": str(uuid.uuid4()),
             "user_id": str(internal_user_id),  # Partition Key
             "timestamp": int(time.time()),  # Sort Key
             "created_at": datetime.now().isoformat(),
