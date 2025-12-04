@@ -15,7 +15,7 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "User"  # 실제 테이블 이름 확인 필요
 
-    id = Column(Integer, primary_key=True, index=True)  # 내부 user_id
+    id = Column("user_id", Integer, primary_key=True, index=True)  # 내부 user_id
     sub = Column(String(255), unique=True, index=True)  # Cognito sub
 
 
