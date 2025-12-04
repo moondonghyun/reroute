@@ -338,9 +338,6 @@ def edge_feats_ext(d: Dict[str, Any], hour: int) -> np.ndarray:
     def has(tag: str) -> bool:
         return any(tag in h for h in hw_list)
 
-    hour_sin = math.sin(2 * math.pi * hour / 24)
-    hour_cos = math.cos(2 * math.pi * hour / 24)
-
     return np.array(
         [
             1.0,
@@ -360,8 +357,6 @@ def edge_feats_ext(d: Dict[str, Any], hour: int) -> np.ndarray:
             float(has("track")),
             float(has("living_street")),
             float(has("pedestrian")),
-            hour_sin,
-            hour_cos,
         ],
         dtype=float,
     )
@@ -458,6 +453,22 @@ def build_graph_from_route(route_coords: Sequence[Tuple[float, float]], margin_m
     except Exception:
         pass
     return G
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371008.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+def polyline_length_m(coords: Sequence[Tuple[float, float]]) -> float:
+    if len(coords) < 2:
+        return 0.0
+    dist = 0.0
+    for i in range(1, len(coords)):
+        lat1, lon1 = coords[i - 1]
+        lat2, lon2 = coords[i]
+        dist += haversine_m(lat1, lon1, lat2, lon2)
+    return dist
 
 
 def run_pipeline(
@@ -499,10 +510,9 @@ def run_pipeline(
     log("[5/5] Reroute with AI weights")
     o = nearest_node(G, start_lat, start_lon)
     dnode = nearest_node(G, end_lat, end_lon)
-    base_nodes = nx.shortest_path(G, o, dnode, weight="len_m_num")
     reroute_nodes = nx.shortest_path(G, o, dnode, weight="weight_runtime")
 
-    base_latlons = path_to_latlons(G, base_nodes, weight_attr="len_m_num")
+    base_latlons = base_route
     reroute_latlons = path_to_latlons(G, reroute_nodes, weight_attr="weight_runtime")
 
     html_path = None
@@ -513,7 +523,7 @@ def run_pipeline(
         tmap_raw=raw,
         base_route=base_latlons,
         rerouted=reroute_latlons,
-        base_weight=path_weight_sum(G, base_nodes, weight_attr="len_m_num"),
+        base_weight=polyline_length_m(base_latlons),
         rerouted_weight=path_weight_sum(G, reroute_nodes, weight_attr="weight_runtime"),
         html_path=html_path,
     )
@@ -628,7 +638,7 @@ if __name__ == "__main__":
     MAIN_ALPHA = ALPHA
     MAIN_HOUR = HOUR_DEFAULT
     MAIN_MARGIN_M = MARGIN_M
-    MAIN_VISUALIZE = False
+    MAIN_VISUALIZE = True
 
     run_cli(
         start_lat=MAIN_START_LAT,
