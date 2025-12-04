@@ -638,7 +638,7 @@ if __name__ == "__main__":
     MAIN_ALPHA = ALPHA
     MAIN_HOUR = HOUR_DEFAULT
     MAIN_MARGIN_M = MARGIN_M
-    MAIN_VISUALIZE = False
+    MAIN_VISUALIZE = True
 
     run_cli(
         start_lat=MAIN_START_LAT,
