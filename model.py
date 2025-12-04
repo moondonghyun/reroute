@@ -27,9 +27,10 @@ import pandas as pd
 import requests
 from shapely.geometry import LineString, MultiLineString, Point, box
 
+
 # ------------------------ Tmap API ------------------------ #
 TMAP_API_URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian"
-TMAP_APP_KEY = os.getenv("TMAP_APP_KEY", "IqFRypKZ8h81kp9xXLyKY5OfY9PwYSxi8K2pHLkb")
+TMAP_APP_KEY = os.getenv("TMAP_APP_KEY")
 TMAP_TIMEOUT = 15
 
 # ------------------------ Defaults ------------------------ #
