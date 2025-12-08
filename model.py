@@ -27,10 +27,9 @@ import pandas as pd
 import requests
 from shapely.geometry import LineString, MultiLineString, Point, box
 
-
 # ------------------------ Tmap API ------------------------ #
 TMAP_API_URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian"
-TMAP_APP_KEY = os.getenv("TMAP_APP_KEY")
+TMAP_APP_KEY = os.getenv("TMAP_APP_KEY", "IqFRypKZ8h81kp9xXLyKY5OfY9PwYSxi8K2pHLkb")
 TMAP_TIMEOUT = 15
 
 # ------------------------ Defaults ------------------------ #
@@ -41,6 +40,8 @@ END_LON = 126.6863
 NETWORK_TYPE = "walk"
 MARGIN_M = 400
 CCTV_XLSX = "cctv_data.xlsx"
+STREETLIGHT_PATH = "nationwide_streetlight.xlsx"
+POLICE_PATH = "Police_station.csv"
 ALPHA = 6.0
 HOUR_DEFAULT = "now"
 OUT_JSON = "model_test/result.json"
@@ -260,12 +261,94 @@ def load_cctv_points(path: str) -> gpd.GeoDataFrame:
 
     df[count_col] = pd.to_numeric(df[count_col], errors="coerce").fillna(1).clip(lower=1)
     gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon_col], df[lat_col]), crs="EPSG:4326")
-    return gdf.rename(columns={count_col: "camera_count"})
+    gdf = gdf.rename(columns={count_col: "camera_count"})
+    if "count" not in gdf.columns:
+        gdf["count"] = gdf["camera_count"]
+    return gdf
 
+
+def load_generic_points(path: str, lat_keys=None, lon_keys=None, count_keys=None) -> gpd.GeoDataFrame:
+    lat_keys = lat_keys or ["lat", "latitude", "위도", "Y", "y"]
+    lon_keys = lon_keys or ["lon", "longitude", "lng", "경도", "X", "x"]
+    count_keys = count_keys or ["count", "cnt", "num", "value"]
+
+    if path.lower().endswith((".csv", ".txt")):
+        df = pd.read_csv(path)
+    else:
+        try:
+            df = gpd.read_file(path)
+        except Exception:
+            df = pd.read_excel(path)
+    if isinstance(df, gpd.GeoDataFrame) and "geometry" in df.columns:
+        gdf = df
+    else:
+        df.columns = df.columns.str.strip()
+        def pick(keys):
+            for k in keys:
+                if k in df.columns:
+                    return k
+            raise KeyError(f"{keys} not found in {path}")
+        lat_col = pick(lat_keys)
+        lon_col = pick(lon_keys)
+        cnt_col = None
+        for k in count_keys:
+            if k in df.columns:
+                cnt_col = k
+                break
+        if cnt_col is None:
+            df["count"] = 1
+            cnt_col = "count"
+        df[cnt_col] = pd.to_numeric(df[cnt_col], errors="coerce").fillna(1).clip(lower=1)
+        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon_col], df[lat_col]), crs="EPSG:4326")
+        gdf = gdf.rename(columns={cnt_col: "count"})
+    if "count" not in gdf.columns:
+        gdf["count"] = 1
+    if not isinstance(gdf, gpd.GeoDataFrame):
+        gdf = gpd.GeoDataFrame(gdf, geometry=gdf["geometry"], crs="EPSG:4326")
+    gdf = gdf[gdf.geometry.notna()]
+    return gdf
+
+
+
+def safe_load_generic_points(path: str, name: str) -> gpd.GeoDataFrame:
+    if not os.path.exists(path):
+        log(f"  warning: {name} file not found at {path}; using empty points.")
+        return gpd.GeoDataFrame(columns=["count", "geometry"], geometry=[], crs="EPSG:4326")
+    return load_generic_points(path)
+
+
+def load_police_points(path: str) -> gpd.GeoDataFrame:
+    """Police_station.csv: now uses A1(=lon), A2(=lat) columns; falls back to first two cols."""
+    if not os.path.exists(path):
+        log(f"  warning: police file not found at {path}; using empty points.")
+        return gpd.GeoDataFrame(columns=["count", "geometry"], geometry=[], crs="EPSG:4326")
+    df = pd.read_csv(path)
+    if df.shape[1] < 2:
+        log(f"  warning: police file lacks lon/lat columns at {path}; using empty points.")
+        return gpd.GeoDataFrame(columns=["count", "geometry"], geometry=[], crs="EPSG:4326")
+
+    lon_series = df["A1"] if "A1" in df.columns else df.iloc[:, 0]
+    lat_series = df["A2"] if "A2" in df.columns else df.iloc[:, 1]
+    lon = pd.to_numeric(lon_series, errors="coerce")
+    lat = pd.to_numeric(lat_series, errors="coerce")
+
+    mask = lon.notna() & lat.notna()
+    if mask.sum() == 0:
+        log(f"  warning: police file has no valid coordinates at {path}; using empty points.")
+        return gpd.GeoDataFrame(columns=["count", "geometry"], geometry=[], crs="EPSG:4326")
+
+    gdf = gpd.GeoDataFrame(
+        {"count": [1] * mask.sum()},
+        geometry=gpd.points_from_xy(lon[mask], lat[mask]),
+        crs="EPSG:4326",
+    )
+    return gdf[gdf.geometry.notna()]
 
 def apply_cctv_weights(
     G: nx.MultiDiGraph,
     cctv_path: str = CCTV_XLSX,
+    streetlight_path: str = STREETLIGHT_PATH,
+    police_path: str = POLICE_PATH,
     radius_m: float = 80.0,
     alpha: float = ALPHA,
 ) -> None:
@@ -279,26 +362,52 @@ def apply_cctv_weights(
     edges_utm["length_m"] = edges_utm["length"] if "length" in edges_utm.columns else edges_utm.length
 
     cctv = load_cctv_points(cctv_path).to_crs(epsg=epsg)
+    street = safe_load_generic_points(streetlight_path, "streetlight").to_crs(epsg=epsg)
+    police = load_police_points(police_path).to_crs(epsg=epsg)
     edges_buf = edges_utm[["u", "v", "key", "geometry"]].copy()
     edges_buf["geometry"] = edges_buf.buffer(radius_m)
 
     try:
-        joined = gpd.sjoin(cctv, edges_buf, predicate="within", how="left")
+        joined_cctv = gpd.sjoin(cctv, edges_buf, predicate="within", how="left")
+        joined_st = gpd.sjoin(street, edges_buf, predicate="within", how="left")
+        joined_po = gpd.sjoin(police, edges_buf, predicate="within", how="left")
     except TypeError:
-        joined = gpd.sjoin(cctv, edges_buf, op="within", how="left")
+        joined_cctv = gpd.sjoin(cctv, edges_buf, op="within", how="left")
+        joined_st = gpd.sjoin(street, edges_buf, op="within", how="left")
+        joined_po = gpd.sjoin(police, edges_buf, op="within", how="left")
 
-    counts = joined.dropna(subset=["u"]).groupby(["u", "v", "key"])["camera_count"].sum().rename("cctv_sum")
-    edges_utm = edges_utm.merge(counts.reset_index(), on=["u", "v", "key"], how="left")
+    def agg_joined(joined_df, col_name):
+        grp = joined_df.dropna(subset=["u"]).groupby(["u", "v", "key"])["count"].sum().rename(col_name)
+        return grp
+
+    counts_cctv = agg_joined(joined_cctv, "cctv_sum")
+    counts_st = agg_joined(joined_st, "light_sum")
+    counts_po = agg_joined(joined_po, "police_sum")
+
+    edges_utm = edges_utm.merge(counts_cctv.reset_index(), on=["u", "v", "key"], how="left")
+    edges_utm = edges_utm.merge(counts_st.reset_index(), on=["u", "v", "key"], how="left")
+    edges_utm = edges_utm.merge(counts_po.reset_index(), on=["u", "v", "key"], how="left")
     edges_utm["cctv_sum"] = edges_utm["cctv_sum"].fillna(0)
+    edges_utm["light_sum"] = edges_utm["light_sum"].fillna(0)
+    edges_utm["police_sum"] = edges_utm["police_sum"].fillna(0)
 
     edges_utm["edge_km"] = edges_utm["length_m"].clip(lower=1e-6) / 1000.0
     edges_utm["density_per_km"] = edges_utm["cctv_sum"] / edges_utm["edge_km"]
+    edges_utm["light_per_km"] = edges_utm["light_sum"] / edges_utm["edge_km"]
+    edges_utm["police_per_km"] = edges_utm["police_sum"] / edges_utm["edge_km"]
 
-    low = float(edges_utm["density_per_km"].quantile(0.05))
-    high = float(edges_utm["density_per_km"].quantile(0.95))
-    rng = max(1e-6, high - low)
-    edges_utm["dens_norm"] = ((edges_utm["density_per_km"] - low) / rng).clip(0, 1)
-    edges_utm["weight_cctv"] = edges_utm["length_m"] / (1.0 + alpha * edges_utm["dens_norm"])
+    def norm_col(df, src, q_low=0.05, q_high=0.95, out="norm"):
+        low = float(df[src].quantile(q_low))
+        high = float(df[src].quantile(q_high))
+        rng = max(1e-6, high - low)
+        df[out] = ((df[src] - low) / rng).clip(0, 1)
+
+    norm_col(edges_utm, "density_per_km", out="dens_norm")
+    norm_col(edges_utm, "light_per_km", out="light_norm")
+    norm_col(edges_utm, "police_per_km", out="police_norm")
+
+    combined_score = edges_utm["dens_norm"] + 1.5 * edges_utm["light_norm"] + 3.0 * edges_utm["police_norm"]
+    edges_utm["weight_cctv"] = edges_utm["length_m"] / (1.0 + alpha * combined_score)
 
     for _, r in edges_utm.iterrows():
         u, v, k = r["u"], r["v"], r["key"]
@@ -308,6 +417,12 @@ def apply_cctv_weights(
             d["cctv_sum"] = float(r["cctv_sum"])
             d["density_per_km"] = float(r["density_per_km"])
             d["dens_norm"] = float(r["dens_norm"])
+            d["light_sum"] = float(r["light_sum"])
+            d["light_per_km"] = float(r["light_per_km"])
+            d["light_norm"] = float(r["light_norm"])
+            d["police_sum"] = float(r["police_sum"])
+            d["police_per_km"] = float(r["police_per_km"])
+            d["police_norm"] = float(r["police_norm"])
             d["weight_cctv"] = float(r["weight_cctv"])
 
 
@@ -318,6 +433,10 @@ def sanitize_graph_edge_attrs(G: nx.MultiDiGraph) -> None:
         d["len_m_num"] = as_float(length_m, default=1.0)
         d["dens_norm_num"] = as_float(d.get("dens_norm", 0.0), default=0.0)
         d["cctv_sum_num"] = as_float(d.get("cctv_sum", 0.0), default=0.0)
+        d["light_norm_num"] = as_float(d.get("light_norm", 0.0), default=0.0)
+        d["light_sum_num"] = as_float(d.get("light_sum", 0.0), default=0.0)
+        d["police_norm_num"] = as_float(d.get("police_norm", 0.0), default=0.0)
+        d["police_sum_num"] = as_float(d.get("police_sum", 0.0), default=0.0)
         if "weight_runtime" in d:
             d["weight_runtime"] = as_float(d["weight_runtime"], default=d["len_m_num"])
         else:
@@ -328,8 +447,14 @@ def edge_feats_ext(d: Dict[str, Any], hour: int) -> np.ndarray:
     L = d["len_m_num"]
     dn = d["dens_norm_num"]
     cctv = d["cctv_sum_num"]
+    light = d.get("light_sum_num", 0.0)
+    police = d.get("police_sum_num", 0.0)
     km = max(1e-6, L / 1000.0)
     cctv_per_km = cctv / km
+    light_per_km = light / km
+    police_per_km = police / km
+    light_norm = d.get("light_norm_num", 0.0)
+    police_norm = d.get("police_norm_num", 0.0)
 
     hw_val = d.get("highway", "")
     hw_list = [str(hw_val).lower()]
@@ -345,6 +470,10 @@ def edge_feats_ext(d: Dict[str, Any], hour: int) -> np.ndarray:
             math.log1p(L),
             dn,
             cctv_per_km,
+            light_per_km,
+            police_per_km,
+            light_norm,
+            police_norm,
             float(has("primary")),
             float(has("secondary")),
             float(has("tertiary")),
@@ -429,6 +558,26 @@ def path_weight_sum(G: nx.MultiDiGraph, nodes_path: Sequence, weight_attr: str =
     return total
 
 
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371008.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def polyline_length_m(coords: Sequence[Tuple[float, float]]) -> float:
+    if len(coords) < 2:
+        return 0.0
+    dist = 0.0
+    for i in range(1, len(coords)):
+        lat1, lon1 = coords[i - 1]
+        lat2, lon2 = coords[i]
+        dist += haversine_m(lat1, lon1, lat2, lon2)
+    return dist
+
+
 # ------------------------ Core pipeline ------------------------ #
 @dataclass
 class PipelineResult:
@@ -454,22 +603,6 @@ def build_graph_from_route(route_coords: Sequence[Tuple[float, float]], margin_m
     except Exception:
         pass
     return G
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371008.8
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-def polyline_length_m(coords: Sequence[Tuple[float, float]]) -> float:
-    if len(coords) < 2:
-        return 0.0
-    dist = 0.0
-    for i in range(1, len(coords)):
-        lat1, lon1 = coords[i - 1]
-        lat2, lon2 = coords[i]
-        dist += haversine_m(lat1, lon1, lat2, lon2)
-    return dist
 
 
 def run_pipeline(
@@ -481,6 +614,8 @@ def run_pipeline(
     app_key: str = TMAP_APP_KEY,
     margin_m: float = MARGIN_M,
     cctv_path: str = CCTV_XLSX,
+    streetlight_path: str = STREETLIGHT_PATH,
+    police_path: str = POLICE_PATH,
     model_path: str = "",
     alpha: float = ALPHA,
     hour: Any = HOUR_DEFAULT,
@@ -493,14 +628,24 @@ def run_pipeline(
     G = build_graph_from_route(base_route, margin_m=margin_m)
 
     log("[3/5] Inject CCTV density")
-    apply_cctv_weights(G, cctv_path=cctv_path, radius_m=80.0, alpha=alpha)
+    apply_cctv_weights(
+        G,
+        cctv_path=cctv_path,
+        streetlight_path=streetlight_path,
+        police_path=police_path,
+        radius_m=80.0,
+        alpha=alpha,
+    )
 
     log("[4/5] Apply model weights")
     sanitize_graph_edge_attrs(G)
     for _, _, _, d in G.edges(keys=True, data=True):
         dn = d["dens_norm_num"]
+        ln = d.get("light_norm_num", 0.0)
+        pn = d.get("police_norm_num", 0.0)
         L = d["len_m_num"]
-        d["weight_runtime"] = L / (1.0 + alpha * dn)
+        score = dn + 1.5 * ln + 3.0 * pn
+        d["weight_runtime"] = L / (1.0 + alpha * score)
     if not model_path:
         raise FileNotFoundError("Model weights path is empty; provide --model.")
     if not os.path.exists(model_path):
@@ -513,6 +658,7 @@ def run_pipeline(
     dnode = nearest_node(G, end_lat, end_lon)
     reroute_nodes = nx.shortest_path(G, o, dnode, weight="weight_runtime")
 
+    # Base route는 Tmap 응답을 그대로 사용
     base_latlons = base_route
     reroute_latlons = path_to_latlons(G, reroute_nodes, weight_attr="weight_runtime")
 
@@ -578,13 +724,19 @@ def run_cli(
     app_key: str = TMAP_APP_KEY,
     margin_m: float = MARGIN_M,
     cctv_xlsx: str = CCTV_XLSX,
+    streetlight_path: str = STREETLIGHT_PATH,
+    police_path: str = POLICE_PATH,
     model: str | None = MODEL_PATH,
     alpha: float = ALPHA,
     hour: Any = HOUR_DEFAULT,
     out_json: str = OUT_JSON,
     out_html: str = OUT_HTML,
-    visualize: bool = False,
+    visualize: bool = True,
 ) -> PipelineResult:
+    """
+    코드 내부에서 바로 호출할 수 있는 진입점.
+    예) run_cli(START_LAT=..., START_LON=..., END_LAT=..., END_LON=..., model="edge_pref_model.json")
+    """
     if not model:
         raise FileNotFoundError("모델 경로(model)가 비었습니다.")
 
@@ -601,6 +753,8 @@ def run_cli(
         app_key=app_key,
         margin_m=margin_m,
         cctv_path=cctv_xlsx,
+        streetlight_path=streetlight_path,
+        police_path=police_path,
         model_path=model,
         alpha=alpha,
         hour=hour,
@@ -629,17 +783,20 @@ def run_cli(
 
 
 if __name__ == "__main__":
+    # 아래 값들만 수정해도 바로 실행 흐름을 제어할 수 있습니다.
     MAIN_START_LAT = START_LAT
     MAIN_START_LON = START_LON
     MAIN_END_LAT = END_LAT
     MAIN_END_LON = END_LON
-    MAIN_MODEL = MODEL_PATH         
+    MAIN_MODEL = MODEL_PATH          # 필수: 모델 가중치 경로
     MAIN_OUT_JSON = OUT_JSON
     MAIN_OUT_HTML = OUT_HTML
     MAIN_ALPHA = ALPHA
     MAIN_HOUR = HOUR_DEFAULT
     MAIN_MARGIN_M = MARGIN_M
-    MAIN_VISUALIZE = False
+    MAIN_STREETLIGHT_PATH = STREETLIGHT_PATH
+    MAIN_POLICE_PATH = POLICE_PATH
+    MAIN_VISUALIZE = True
 
     run_cli(
         start_lat=MAIN_START_LAT,
@@ -649,6 +806,8 @@ if __name__ == "__main__":
         app_key=TMAP_APP_KEY,
         margin_m=MAIN_MARGIN_M,
         cctv_xlsx=CCTV_XLSX,
+        streetlight_path=MAIN_STREETLIGHT_PATH,
+        police_path=MAIN_POLICE_PATH,
         model=MAIN_MODEL,
         alpha=MAIN_ALPHA,
         hour=MAIN_HOUR,
