@@ -26,6 +26,7 @@ import osmnx as ox
 import pandas as pd
 import requests
 from shapely.geometry import LineString, MultiLineString, Point, box
+import branca.colormap as cm
 
 # ------------------------ Tmap API ------------------------ #
 TMAP_API_URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian"
@@ -150,10 +151,83 @@ def latlon_to_graph_xy(Gp, lat: float, lon: float) -> Tuple[float, float]:
     return float(geom.x), float(geom.y)
 
 
-def nearest_node(G, lat: float, lon: float):
+def nearest_node(G, lat, lon):
     Gp = project_graph_compat(G)
     x, y = latlon_to_graph_xy(Gp, lat, lon)
-    return ox.distance.nearest_nodes(Gp, x, y)
+    
+    # 1. 일단 가장 가까운 노드(기존 방식)를 찾음 (후보 1)
+    nearest_node = ox.distance.nearest_nodes(Gp, x, y)
+    
+    # 2. 그 노드가 어떤 도로에 붙어있는지 확인
+    # (해당 노드에 연결된 엣지들의 highway 태그를 검사)
+    hw_types = []
+    try:
+        # 이 노드에서 나가는 도로들을 확인
+        for _, _, data in G.edges(nearest_node, data=True):
+            hw = data.get("highway", "")
+            if isinstance(hw, list): hw = hw[0]
+            hw_types.append(str(hw))
+    except:
+        pass
+    
+    # 3. 만약 뒷골목(service, track, path)이나 좁은길이라면, 더 넓은 길을 찾아봄
+    # (예: service 로드라면 반경 50m 내의 다른 노드를 탐색)
+    BAD_ROADS = ["service", "track", "path", "footway", "steps", "corridor"]
+    
+    is_bad_node = False
+    if not hw_types: 
+        is_bad_node = True # 연결된 도로 정보가 없으면 나쁜 노드 취급
+    else:
+        # 연결된 도로 중 하나라도 '좋은 도로'가 없으면 나쁜 노드
+        # 즉, 모든 도로가 bad_roads에 속하면 True
+        if all(any(bad in h for bad in BAD_ROADS) for h in hw_types):
+            is_bad_node = True
+
+    if is_bad_node:
+        # log(f"  [스마트 스냅] '{nearest_node}'는 뒷골목({hw_types})입니다. 큰 길을 찾습니다...")
+        
+        # 현재 노드의 '이웃 노드'들을 뒤져서 더 좋은 도로(residential, tertiary 등)가 있는지 확인
+        # (BFS 탐색: 1단계 이웃만 확인)
+        best_node = nearest_node
+        min_penalty_dist = float('inf')
+        
+        neighbors = list(G.neighbors(nearest_node))
+        
+        # 현재 노드의 좌표
+        nx_val = G.nodes[nearest_node]['x']
+        ny_val = G.nodes[nearest_node]['y']
+        base_dist = ((x - nx_val)**2 + (y - ny_val)**2)**0.5 # 현재 노드까지의 거리
+        
+        # 이웃 노드 평가
+        for n in neighbors:
+            # 이웃 노드의 도로 타입 확인
+            n_hw_types = []
+            for _, _, d in G.edges(n, data=True):
+                h = d.get("highway", "")
+                if isinstance(h, list): h = h[0]
+                n_hw_types.append(str(h))
+            
+            # 이웃이 '좋은 도로'를 포함하고 있는지?
+            is_good_neighbor = False
+            if n_hw_types and not all(any(bad in h for bad in BAD_ROADS) for h in n_hw_types):
+                is_good_neighbor = True
+            
+            if is_good_neighbor:
+                # 거리 계산
+                nx_n = G.nodes[n]['x']
+                ny_n = G.nodes[n]['y']
+                dist_n = ((x - nx_n)**2 + (y - ny_n)**2)**0.5
+                
+                # [핵심 로직]
+                # 좋은 도로라면 거리에 '보너스(할인)'를 줌 (예: 30m 정도는 더 멀어도 봐줌)
+                # 즉, 뒷골목 5m보다 큰길 30m를 더 선호하게 만듦
+                score = dist_n - 30.0 
+                
+                if score < base_dist: # 원래 노드보다 점수가 좋으면 교체
+                    return n
+                    
+    # 더 좋은 대안이 없거나, 원래 노드가 이미 큰 길이라면 그대로 반환
+    return nearest_node
 
 
 def extract_linestring_coords_from_features(features: Iterable[Dict[str, Any]]) -> List[Tuple[float, float]]:
@@ -657,10 +731,15 @@ def run_pipeline(
     o = nearest_node(G, start_lat, start_lon)
     dnode = nearest_node(G, end_lat, end_lon)
     reroute_nodes = nx.shortest_path(G, o, dnode, weight="weight_runtime")
-
+    
     # Base route는 Tmap 응답을 그대로 사용
     base_latlons = base_route
     reroute_latlons = path_to_latlons(G, reroute_nodes, weight_attr="weight_runtime")
+
+    if reroute_latlons:
+        start_pt = (start_lat, start_lon)
+        end_pt = (end_lat, end_lon)
+        reroute_latlons = [start_pt] + reroute_latlons + [end_pt]
 
     html_path = None
     if html_out:
@@ -685,25 +764,68 @@ def visualize_routes(
 ) -> str:
     nodes_gdf = ox.graph_to_gdfs(G, nodes=True, edges=False)
     cy, cx = nodes_gdf["y"].mean(), nodes_gdf["x"].mean()
+    
     import folium
-
     m = folium.Map(location=(cy, cx), zoom_start=15, tiles="cartodbpositron")
+    
     edges = ox.graph_to_gdfs(G, nodes=False, edges=True).reset_index()
+
+    # [1] 컬러맵 생성 (CCTV 밀집도 기준)
+    # 값이 없으면 0으로 처리
+    if "density_per_km" not in edges.columns:
+        edges["density_per_km"] = 0.0
+        
+    vals = edges["density_per_km"]
+    # 하위 5% ~ 상위 5% 기준으로 색상 범위 설정 (너무 튀는 값 제외)
+    vmin = float(vals.quantile(0.05))
+    vmax = float(vals.quantile(0.95))
+    if vmin == vmax: vmax = vmin + 0.0001
+    
+    cmap = cm.linear.RdYlGn_11.scale(vmin, vmax)
+    cmap.caption = "Safety Score (CCTV Density)"
+    
+    # [2] 도로 그리기 (가중치에 따라 색칠)
     for _, r in edges.iterrows():
         geom = r["geometry"]
+        dens = float(r.get("density_per_km", 0.0))
+        
+        # 색상 결정
+        color = cmap(dens)
+        
+        # 툴팁에 상세 정보 표시
+        tooltip_txt = (
+            f"CCTV: {r.get('cctv_sum', 0)}대<br>"
+            f"보안등: {r.get('light_sum', 0)}개<br>"
+            f"경찰서: {r.get('police_sum', 0)}개<br>"
+            f"밀집도: {dens:.2f}"
+        )
+
         if isinstance(geom, LineString):
             xs, ys = list(geom.coords.xy[0]), list(geom.coords.xy[1])
-            folium.PolyLine([(ys[i], xs[i]) for i in range(len(xs))], color="#b8b8b8", weight=3, opacity=0.55).add_to(m)
+            folium.PolyLine(
+                [(ys[i], xs[i]) for i in range(len(xs))],
+                color=color, weight=4, opacity=0.7, tooltip=tooltip_txt
+            ).add_to(m)
         elif isinstance(geom, MultiLineString):
             for line in geom.geoms:
                 xs, ys = list(line.coords.xy[0]), list(line.coords.xy[1])
-                folium.PolyLine([(ys[i], xs[i]) for i in range(len(xs))], color="#b8b8b8", weight=3, opacity=0.55).add_to(m)
+                folium.PolyLine(
+                    [(ys[i], xs[i]) for i in range(len(xs))],
+                    color=color, weight=4, opacity=0.7, tooltip=tooltip_txt
+                ).add_to(m)
+
+    # [3] 경로 그리기 (기존 로직 유지)
     if base_route:
-        folium.PolyLine(base_route, color="blue", weight=6, opacity=0.75, tooltip="Tmap base").add_to(m)
+        folium.PolyLine(base_route, color="blue", weight=4, opacity=0.5, dash_array='5, 10', tooltip="Tmap 추천 (최단)").add_to(m)
+    
     if rerouted:
         folium.PolyLine(rerouted, color="magenta", weight=7, opacity=0.95, tooltip="AI reroute").add_to(m)
         folium.Marker(rerouted[0], icon=folium.Icon(color="green", icon="play"), tooltip="start").add_to(m)
         folium.Marker(rerouted[-1], icon=folium.Icon(color="red", icon="stop"), tooltip="end").add_to(m)
+    
+    # 컬러바 추가
+    cmap.add_to(m)
+    
     os.makedirs(os.path.dirname(html_out), exist_ok=True)
     m.save(html_out)
     log(f"[TEST] HTML saved: {html_out}")
