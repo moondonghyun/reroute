@@ -115,7 +115,8 @@ def calculate_route(
             hour=req.hour,
             app_key=os.getenv("TMAP_APP_KEY"),
             cctv_path="./cctv_data.xlsx",
-            model_path="./edge_pref_model_dataset.json"
+            model_path="./edge_pref_model_dataset.json",
+            html_out="/app/model_test/compare.html"
         )
 
         # 2. 직사각형 범위(Bounding Box) 계산
