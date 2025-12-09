@@ -268,6 +268,55 @@ def parse_route_coords(raw: Dict[str, Any]) -> List[Tuple[float, float]]:
     raise ValueError("No LineString coordinates found in Tmap response")
 
 
+def extract_visual_segments(G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
+    # 1. 그래프에서 엣지(도로) 데이터 추출
+    edges = ox.graph_to_gdfs(G, nodes=False, edges=True).reset_index()
+
+    # 2. 색상 계산을 위한 준비 (CCTV 밀집도 기준)
+    if "density_per_km" not in edges.columns:
+        edges["density_per_km"] = 0.0
+
+    vals = edges["density_per_km"]
+    vmin = float(vals.quantile(0.05))
+    vmax = float(vals.quantile(0.95))
+    if vmin == vmax: vmax = vmin + 0.0001
+
+    # Python에서 색상 코드를 계산해주는 도구 (기존과 동일한 로직)
+    cmap = cm.linear.RdYlGn_11.scale(vmin, vmax)
+
+    segments = []
+
+    for _, r in edges.iterrows():
+        geom = r["geometry"]
+        dens = float(r.get("density_per_km", 0.0))
+
+        # [핵심] 점수(dens)를 넣으면 Hex Color Code (#RRGGBB)를 뱉어줌
+        color_hex = cmap(dens)
+
+        # 좌표 추출 ([lat, lon] 순서로 변환)
+        coords = []
+        if isinstance(geom, LineString):
+            # (lon, lat) -> (lat, lon)
+            coords = [(y, x) for x, y in list(geom.coords)]
+        elif isinstance(geom, MultiLineString):
+            for line in geom.geoms:
+                coords += [(y, x) for x, y in list(line.coords)]
+
+        # 결과 리스트에 추가
+        segments.append({
+            "geometry": coords,  # [[37.xx, 126.xx], [37.xx, 126.xx], ...]
+            "color": color_hex,  # "#d9f0a3" (안전도에 따른 색상)
+            "properties": {  # 상세 정보 (앱에서 클릭 시 보여줄 용도)
+                "cctv_count": int(r.get('cctv_sum', 0)),
+                "light_count": int(r.get('light_sum', 0)),
+                "police_count": int(r.get('police_sum', 0)),
+                "density": float(f"{dens:.2f}")
+            }
+        })
+
+    return segments
+
+
 # ------------------------ Tmap fetch ------------------------ #
 def fetch_tmap_route(
     start_lat: float,
@@ -661,6 +710,7 @@ class PipelineResult:
     base_weight: float
     rerouted_weight: float
     html_path: str | None = None
+    visual_segments: List[Dict[str, Any]] | None = None
 
 
 def build_graph_from_route(route_coords: Sequence[Tuple[float, float]], margin_m: float = MARGIN_M) -> nx.MultiDiGraph:
@@ -740,7 +790,7 @@ def run_pipeline(
         start_pt = (start_lat, start_lon)
         end_pt = (end_lat, end_lon)
         reroute_latlons = [start_pt] + reroute_latlons + [end_pt]
-
+    visual_segments = extract_visual_segments(G)
     html_path = None
     if html_out:
         html_path = visualize_routes(G, base_latlons, reroute_latlons, html_out)
@@ -752,6 +802,7 @@ def run_pipeline(
         base_weight=polyline_length_m(base_latlons),
         rerouted_weight=path_weight_sum(G, reroute_nodes, weight_attr="weight_runtime"),
         html_path=html_path,
+        visual_segments=visual_segments
     )
 
 
