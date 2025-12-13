@@ -1,5 +1,6 @@
 """
-Unified dynamic routing pipeline (Optimized for Pre-loading).
+model.py
+Unified dynamic routing pipeline (Optimized for Pre-loading Multi-City).
 """
 from __future__ import annotations
 
@@ -24,11 +25,13 @@ TMAP_API_URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian"
 TMAP_APP_KEY = os.getenv("TMAP_APP_KEY", "IqFRypKZ8h81kp9xXLyKY5OfY9PwYSxi8K2pHLkb")
 TMAP_TIMEOUT = 15
 
-# 기본 설정 (인천 중심)
-START_LAT = 37.4451
-START_LON = 126.6942
-END_LAT = 37.4166
-END_LON = 126.6863
+# [설정] 지원할 도시 목록 (중심좌표, 반경m)
+# t3.xlarge (16GB) 기준: 서울(15km) + 인천(12km) 동시 로딩 가능
+CITIES_CONFIG = {
+    "incheon": {"lat": 37.4563, "lon": 126.7052, "dist": 12000}, # 인천 반경 12km
+    "seoul":   {"lat": 37.5665, "lon": 126.9780, "dist": 15000}, # 서울 반경 15km
+}
+
 NETWORK_TYPE = "walk"
 CCTV_XLSX = "cctv_data.xlsx"
 STREETLIGHT_PATH = "nationwide_streetlight.xlsx"
@@ -139,22 +142,21 @@ def apply_weights_to_graph(G: nx.MultiDiGraph, alpha: float = ALPHA) -> None:
     # 길이 계산
     edges_utm["length_m"] = edges_utm.length
 
-    # 데이터 로드 (파일 경로가 있으면 로드)
+    # 데이터 로드
     cctv = load_cctv_points(CCTV_XLSX).to_crs(epsg=epsg)
     street = load_generic_points(STREETLIGHT_PATH).to_crs(epsg=epsg)
-    police = load_generic_points(POLICE_PATH).to_crs(epsg=epsg) # Police도 generic 사용
+    police = load_generic_points(POLICE_PATH).to_crs(epsg=epsg)
 
     # 버퍼 생성 (도로 주변 80m)
     edges_buf = edges_utm[["u", "v", "key", "geometry"]].copy()
     edges_buf["geometry"] = edges_buf.buffer(80.0)
 
-    # 공간 조인 (Spatial Join) - 여기가 가장 무거운 작업 (Startup에서 한 번만 수행)
+    # 공간 조인 (Spatial Join)
     try:
         joined_cctv = gpd.sjoin(cctv, edges_buf, predicate="within", how="left")
         joined_st = gpd.sjoin(street, edges_buf, predicate="within", how="left")
         joined_po = gpd.sjoin(police, edges_buf, predicate="within", how="left")
     except:
-        # 구버전 geopandas 호환
         joined_cctv = gpd.sjoin(cctv, edges_buf, op="within", how="left")
         joined_st = gpd.sjoin(street, edges_buf, op="within", how="left")
         joined_po = gpd.sjoin(police, edges_buf, op="within", how="left")
@@ -190,8 +192,7 @@ def apply_weights_to_graph(G: nx.MultiDiGraph, alpha: float = ALPHA) -> None:
     edges_utm["light_norm"] = normalize(edges_utm["light_per_km"])
     edges_utm["police_norm"] = normalize(edges_utm["police_per_km"])
 
-    # 가중치 계산 (기본)
-    # score = dens_norm + 1.5*light + 3.0*police
+    # 가중치 계산
     combined_score = edges_utm["dens_norm"] + 1.5 * edges_utm["light_norm"] + 3.0 * edges_utm["police_norm"]
     edges_utm["weight_cctv"] = edges_utm["length_m"] / (1.0 + alpha * combined_score)
 
@@ -233,7 +234,6 @@ def edge_feats_ext(d: Dict[str, Any], hour: int) -> np.ndarray:
     ], dtype=float)
 
 def sigmoid(z): 
-    # overflow 방지
     z = max(-500, min(500, z))
     return 1.0 / (1.0 + math.exp(-z))
 
@@ -243,12 +243,11 @@ def update_graph_with_model(G, model_path, hour, alpha):
             weights = np.array(json.load(f)["weights"])
     except:
         log("⚠️ 모델 파일 로드 실패. 기본 가중치를 사용합니다.")
-        weights = np.zeros(21) # fallback
+        weights = np.zeros(21)
 
     for _, _, d in G.edges(data=True):
         x = edge_feats_ext(d, hour)
         score = sigmoid(np.dot(weights, x))
-        # weight_runtime이 최종 Dijkstra에 사용될 가중치입니다.
         d["weight_runtime"] = d.get("len_m_num", 1.0) / (1.0 + alpha * score)
 
 # ------------------------ Main Logic ------------------------ #
@@ -261,27 +260,50 @@ class PipelineResult:
     rerouted_weight: float
     visual_segments: List[Dict[str, Any]] | None = None
 
-# ★ [핵심] 정적 그래프 로딩 함수 (서버 켤 때 한 번만 호출)
-def load_static_graph(center_lat=37.4563, center_lon=126.7052, dist_m=10000):
-    log(f"🚀 [Startup] Building Graph (radius={dist_m}m)... This may take a while.")
-    # 1. 그래프 다운로드
-    # simplify=True로 노드 수를 줄여 메모리 절약
+# [★] 정적 그래프 로딩 함수
+def load_static_graph(center_lat, center_lon, dist_m):
+    log(f"🚀 Building Graph (r={dist_m}m)...")
     G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="walk", simplify=True)
-    
-    # 2. 투영 및 가중치 주입 (여기서 sjoin 등 무거운 작업 수행)
-    log("🚀 [Startup] Injecting Weights (CCTV, Lights)...")
     apply_weights_to_graph(G)
-    
-    # 3. AI 모델 적용 (기본값 now)
-    log("🚀 [Startup] Applying AI Model...")
     update_graph_with_model(G, MODEL_PATH, resolve_hour("now"), ALPHA)
-    
-    # 4. 투영된 그래프(m 단위)로 반환
     G_proj = ox.project_graph(G)
-    log("✅ [Startup] Graph Ready! Loaded into Memory.")
     return G_proj
 
-# 경로 찾기 (미리 로딩된 G 사용)
+# [★] 그래프 매니저: 여러 도시를 관리
+class GraphManager:
+    def __init__(self):
+        self.graphs = {}
+
+    def load_all_cities(self):
+        """서버 시작 시 정의된 모든 도시 로딩"""
+        for name, info in CITIES_CONFIG.items():
+            log(f"🏙️ [System] '{name.upper()}' 지도 생성 및 데이터 주입 중... (오래 걸림)")
+            try:
+                start_t = time.time()
+                G = load_static_graph(info["lat"], info["lon"], info["dist"])
+                self.graphs[name] = G
+                elapsed = time.time() - start_t
+                log(f"✅ [System] '{name.upper()}' 완료! ({elapsed:.1f}초)")
+            except Exception as e:
+                log(f"🔥 [System] '{name.upper()}' 실패: {e}")
+
+    def get_graph(self, lat, lon):
+        """좌표와 가장 가까운 도시의 그래프 반환"""
+        best_city = None
+        min_dist = float('inf')
+
+        for name, info in CITIES_CONFIG.items():
+            dist = (lat - info["lat"])**2 + (lon - info["lon"])**2
+            if dist < min_dist:
+                min_dist = dist
+                best_city = name
+        
+        return self.graphs.get(best_city)
+
+# 전역 인스턴스
+graph_manager = GraphManager()
+
+# 경로 찾기
 def nearest_node(G, lat, lon):
     x, y = latlon_to_graph_xy(G, lat, lon)
     return ox.distance.nearest_nodes(G, x, y)
@@ -289,11 +311,11 @@ def nearest_node(G, lat, lon):
 def run_pipeline(
     start_lat, start_lon, end_lat, end_lon,
     app_key, 
-    preloaded_graph=None, # <--- 여기가 핵심
+    preloaded_graph=None,
     **kwargs
 ) -> PipelineResult:
     
-    # 1. Tmap 호출 (비교용)
+    # 1. Tmap 호출
     params = {
         "version": "1", "startX": str(start_lon), "startY": str(start_lat),
         "endX": str(end_lon), "endY": str(end_lat), "startName": "S", "endName": "E", "appKey": app_key
@@ -310,11 +332,11 @@ def run_pipeline(
         raw = {}
         base_route = []
 
-    # 2. 그래프 준비 (메모리 로딩된 것 사용)
+    # 2. 그래프 준비
     if preloaded_graph:
         G = preloaded_graph
     else:
-        # fallback: 로컬 그래프 생성 (매우 느림 - 비상용)
+        # 비상용 (느림)
         G = ox.graph_from_point(((start_lat+end_lat)/2, (start_lon+end_lon)/2), dist=500, network_type="walk")
         G = ox.project_graph(G)
 
@@ -328,10 +350,7 @@ def run_pipeline(
         
         for i in range(len(path_nodes)-1):
             u, v = path_nodes[i], path_nodes[i+1]
-            # 엣지 중 길이가 가장 짧은 것 선택 (MultiGraph 대비)
             edges = G.get_edge_data(u, v)
-            # edges가 dict 형태 {0: {attr...}, 1: {attr...}}
-            # 가장 가중치 낮은 키 찾기
             best_key = min(edges, key=lambda k: edges[k].get("weight_runtime", 1e9))
             data = edges[best_key]
             
@@ -342,13 +361,11 @@ def run_pipeline(
                 rerouted.append((G.nodes[u]['y'], G.nodes[u]['x']))
         rerouted.append((G.nodes[dest]['y'], G.nodes[dest]['x']))
     except nx.NetworkXNoPath:
-        log("❌ No path found between nodes.")
         rerouted = []
-    except Exception as e:
-        log(f"❌ Error finding path: {e}")
+    except Exception:
         rerouted = []
 
-    # 4. 시각화 데이터 추출 (전체 그래프가 아니라 경로 주변만!)
+    # 4. 시각화 데이터 추출
     visual_segments = extract_visual_segments_bbox(G, start_lat, start_lon, end_lat, end_lon)
 
     return PipelineResult(
@@ -361,36 +378,26 @@ def run_pipeline(
     )
 
 def extract_visual_segments_bbox(G, slat, slon, elat, elon, padding=0.005):
-    """
-    전체 그래프를 다 뒤지면 느리니까 BBox 내의 엣지만 필터링해서 시각화 데이터를 만듭니다.
-    """
     min_lat, max_lat = min(slat, elat) - padding, max(slat, elat) + padding
     min_lon, max_lon = min(slon, elon) - padding, max(slon, elon) + padding
     
     segments = []
-    
-    # 노드들의 좌표 캐싱 (속도 향상)
     nodes = G.nodes
     
     for u, v, d in G.edges(data=True):
         uy, ux = nodes[u]['y'], nodes[u]['x']
-        
-        # 엣지 시작점이 범위 안에 있으면 추가 (대략적인 필터링)
         if min_lat <= uy <= max_lat and min_lon <= ux <= max_lon:
             coords = []
             if "geometry" in d:
                 xs, ys = d["geometry"].xy
-                coords = list(zip(ys, xs)) # (lat, lon)
+                coords = list(zip(ys, xs))
             else:
                 coords = [(uy, ux), (nodes[v]['y'], nodes[v]['x'])]
             
-            # 색상 계산
             dens = d.get("density_per_km", 0.0)
-            
-            # 컬러맵 (초록 -> 빨강)
-            color = "#1a9641" # Green
-            if dens < 5: color = "#d7191c" # Red
-            elif dens < 15: color = "#fdae61" # Orange
+            color = "#1a9641"
+            if dens < 5: color = "#d7191c"
+            elif dens < 15: color = "#fdae61"
             
             segments.append({
                 "geometry": coords,
