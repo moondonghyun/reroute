@@ -1,6 +1,6 @@
 """
 model.py
-Unified dynamic routing pipeline (Hybrid Mode: Pre-load + On-the-fly).
+Unified dynamic routing pipeline (Hybrid Mode + Coordinate Transformation).
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 from shapely.geometry import LineString, MultiLineString, Point, box
 import branca.colormap as cm
+from pyproj import Transformer  # [★] 좌표 변환을 위한 필수 라이브러리
 
 # ------------------------ Settings ------------------------ #
 TMAP_API_URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian"
@@ -26,9 +27,11 @@ TMAP_APP_KEY = os.getenv("TMAP_APP_KEY", "IqFRypKZ8h81kp9xXLyKY5OfY9PwYSxi8K2pHL
 TMAP_TIMEOUT = 15
 
 # [설정] 미리 메모리에 올릴 도시 (Fast Mode 지원 지역)
+# t3.xlarge (16GB) 기준: 서울 + 인천 + (수원 or 부산) 정도 가능
 CITIES_CONFIG = {
     "incheon": {"lat": 37.4563, "lon": 126.7052, "dist": 12000}, # 인천 반경 12km
     "seoul":   {"lat": 37.5665, "lon": 126.9780, "dist": 15000}, # 서울 반경 15km
+    # "suwon": {"lat": 37.2636, "lon": 127.0286, "dist": 10000}, # (선택사항)
 }
 
 NETWORK_TYPE = "walk"
@@ -155,7 +158,7 @@ def apply_weights_to_graph(G: nx.MultiDiGraph, alpha: float = ALPHA) -> None:
         joined_st = gpd.sjoin(street, edges_buf, op="within", how="left")
         joined_po = gpd.sjoin(police, edges_buf, op="within", how="left")
 
-    # 집계 및 병합
+    # 집계
     def agg_count(joined, col):
         return joined.groupby(["u", "v", "key"])["count"].sum().rename(col)
 
@@ -166,14 +169,16 @@ def apply_weights_to_graph(G: nx.MultiDiGraph, alpha: float = ALPHA) -> None:
     edges_utm = edges_utm.join(counts_cctv, on=["u", "v", "key"])
     edges_utm = edges_utm.join(counts_st, on=["u", "v", "key"])
     edges_utm = edges_utm.join(counts_po, on=["u", "v", "key"])
+    
     edges_utm = edges_utm.fillna({"cctv_sum": 0, "light_sum": 0, "police_sum": 0})
 
-    # 밀집도 및 정규화
+    # 밀집도 계산
     edges_utm["edge_km"] = edges_utm["length_m"].clip(lower=1e-6) / 1000.0
     edges_utm["density_per_km"] = edges_utm["cctv_sum"] / edges_utm["edge_km"]
     edges_utm["light_per_km"] = edges_utm["light_sum"] / edges_utm["edge_km"]
     edges_utm["police_per_km"] = edges_utm["police_sum"] / edges_utm["edge_km"]
 
+    # 정규화
     def normalize(s):
         lower = s.quantile(0.05)
         upper = s.quantile(0.95)
@@ -184,9 +189,11 @@ def apply_weights_to_graph(G: nx.MultiDiGraph, alpha: float = ALPHA) -> None:
     edges_utm["light_norm"] = normalize(edges_utm["light_per_km"])
     edges_utm["police_norm"] = normalize(edges_utm["police_per_km"])
 
+    # 가중치 계산
     combined_score = edges_utm["dens_norm"] + 1.5 * edges_utm["light_norm"] + 3.0 * edges_utm["police_norm"]
     edges_utm["weight_cctv"] = edges_utm["length_m"] / (1.0 + alpha * combined_score)
 
+    # 그래프에 속성 업데이트
     for _, r in edges_utm.iterrows():
         if G.has_edge(r["u"], r["v"], r["key"]):
             d = G[r["u"]][r["v"]][r["key"]]
@@ -253,9 +260,12 @@ class PipelineResult:
 # [★] 정적 그래프 로딩 함수
 def load_static_graph(center_lat, center_lon, dist_m):
     log(f"🚀 Building Graph (r={dist_m}m)...")
+    # simplify=True로 메모리 최적화
     G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="walk", simplify=True)
     apply_weights_to_graph(G)
     update_graph_with_model(G, MODEL_PATH, resolve_hour("now"), ALPHA)
+    
+    # [중요] 투영된 그래프를 반환 (이때 좌표계가 m 단위로 바뀜 -> 나중에 역변환 필요)
     G_proj = ox.project_graph(G)
     return G_proj
 
@@ -267,7 +277,7 @@ class GraphManager:
     def load_all_cities(self):
         """서버 시작 시 정의된 모든 도시 로딩"""
         for name, info in CITIES_CONFIG.items():
-            log(f"🏙️ [System] '{name.upper()}' 지도 생성 및 데이터 주입 중... (오래 걸림)")
+            log(f"🏙️ [System] '{name.upper()}' 지도 생성 중... (메모리 로딩)")
             try:
                 start_t = time.time()
                 G = load_static_graph(info["lat"], info["lon"], info["dist"])
@@ -278,12 +288,8 @@ class GraphManager:
                 log(f"🔥 [System] '{name.upper()}' 실패: {e}")
 
     def get_graph(self, lat, lon):
-        """
-        좌표가 지원 도시 반경 내(약 20km)에 있으면 그래프 반환
-        아니면 None 반환 -> Fallback으로 이동
-        """
-        # 0.2도 ~= 약 22km (제곱 계산)
-        limit_dist_sq = (0.2) ** 2
+        """좌표 반경 20km 이내면 메모리 그래프 반환, 아니면 None"""
+        limit_dist_sq = (0.2) ** 2 # 약 20km
         
         best_city = None
         min_dist = float('inf')
@@ -294,7 +300,6 @@ class GraphManager:
                 min_dist = dist
                 best_city = name
         
-        # 너무 멀면 지원 안 함(None 반환)
         if min_dist > limit_dist_sq:
             return None
         
@@ -303,6 +308,7 @@ class GraphManager:
 # 전역 인스턴스
 graph_manager = GraphManager()
 
+# 경로 찾기
 def nearest_node(G, lat, lon):
     x, y = latlon_to_graph_xy(G, lat, lon)
     return ox.distance.nearest_nodes(G, x, y)
@@ -314,7 +320,7 @@ def run_pipeline(
     **kwargs
 ) -> PipelineResult:
     
-    # 1. Tmap 호출
+    # 1. Tmap 호출 (Base Route)
     params = {
         "version": "1", "startX": str(start_lon), "startY": str(start_lat),
         "endX": str(end_lon), "endY": str(end_lat), "startName": "S", "endName": "E", "appKey": app_key
@@ -333,21 +339,14 @@ def run_pipeline(
 
     # 2. 그래프 준비 (하이브리드 로직)
     if preloaded_graph:
-        # [Case A] Fast Mode (서울/인천)
         G = preloaded_graph
     else:
-        # [Case B] Slow Mode (기타 지역) - 실시간 생성
-        log("🐢 [Fallback] 지원하지 않는 지역입니다. 실시간 생성 시작 (10~30초 소요)...")
-        
-        # 출발-도착 중심점 계산
+        # [Fallback] 실시간 생성 (느림)
+        log("🐢 [Fallback] 지원하지 않는 지역. 실시간 생성 시작...")
         center_lat = (start_lat + end_lat) / 2
         center_lon = (start_lon + end_lon) / 2
-        
-        # 거리 계산 (단위: 도 -> 미터 대략 변환)
         dist_deg = ((start_lat - end_lat)**2 + (start_lon - end_lon)**2)**0.5
-        # 최소 1km, 넉넉하게 1.5배 마진
         dist_m = max(1000, dist_deg * 111000 * 1.5)
-        
         G = load_static_graph(center_lat, center_lon, dist_m=int(dist_m))
 
     # 3. 길 찾기
@@ -355,6 +354,13 @@ def run_pipeline(
     dest = nearest_node(G, end_lat, end_lon)
     
     rerouted = []
+    
+    # [★ 중요] 좌표 역변환기 생성 (Graph CRS -> WGS84)
+    # G.graph['crs']가 보통 UTM 좌표계임
+    graph_crs = G.graph.get("crs", "EPSG:3857")
+    # always_xy=True : 입력(X,Y) -> 출력(Lon, Lat)
+    transformer = Transformer.from_crs(graph_crs, "EPSG:4326", always_xy=True)
+
     try:
         path_nodes = nx.shortest_path(G, orig, dest, weight="weight_runtime")
         
@@ -366,17 +372,29 @@ def run_pipeline(
             
             if "geometry" in data:
                 xs, ys = data["geometry"].xy
-                rerouted.extend(list(zip(ys, xs)))
+                # [변환] LineString 좌표 변환
+                # transformer.transform(x, y) -> (lon, lat)
+                lonlats = [transformer.transform(x, y) for x, y in zip(xs, ys)]
+                rerouted.extend([(lat, lon) for lon, lat in lonlats])
             else:
-                rerouted.append((G.nodes[u]['y'], G.nodes[u]['x']))
-        rerouted.append((G.nodes[dest]['y'], G.nodes[dest]['x']))
+                # [변환] 노드 좌표 변환
+                ux, uy = G.nodes[u]['x'], G.nodes[u]['y']
+                ulon, ulat = transformer.transform(ux, uy)
+                rerouted.append((ulat, ulon))
+        
+        # 마지막 노드 처리
+        dx, dy = G.nodes[dest]['x'], G.nodes[dest]['y']
+        dlon, dlat = transformer.transform(dx, dy)
+        rerouted.append((dlat, dlon))
+
     except nx.NetworkXNoPath:
         rerouted = []
-    except Exception:
+    except Exception as e:
+        log(f"Error: {e}")
         rerouted = []
 
-    # 4. 시각화 데이터 추출
-    visual_segments = extract_visual_segments_bbox(G, start_lat, start_lon, end_lat, end_lon)
+    # 4. 시각화 데이터 추출 (여기도 변환기 전달)
+    visual_segments = extract_visual_segments_bbox(G, start_lat, start_lon, end_lat, end_lon, transformer)
 
     return PipelineResult(
         tmap_raw=raw,
@@ -387,7 +405,10 @@ def run_pipeline(
         visual_segments=visual_segments
     )
 
-def extract_visual_segments_bbox(G, slat, slon, elat, elon, padding=0.005):
+def extract_visual_segments_bbox(G, slat, slon, elat, elon, transformer, padding=0.005):
+    """
+    BBox 내 엣지를 추출하고 위경도로 변환해서 반환
+    """
     min_lat, max_lat = min(slat, elat) - padding, max(slat, elat) + padding
     min_lon, max_lon = min(slon, elon) - padding, max(slon, elon) + padding
     
@@ -395,19 +416,28 @@ def extract_visual_segments_bbox(G, slat, slon, elat, elon, padding=0.005):
     nodes = G.nodes
     
     for u, v, d in G.edges(data=True):
-        uy, ux = nodes[u]['y'], nodes[u]['x']
-        if min_lat <= uy <= max_lat and min_lon <= ux <= max_lon:
+        ux, uy = nodes[u]['x'], nodes[u]['y']
+        
+        # 1. 노드 좌표 역변환 (검사를 위해)
+        ulon, ulat = transformer.transform(ux, uy)
+        
+        # 2. 범위 체크 (위경도 기준)
+        if min_lat <= ulat <= max_lat and min_lon <= ulon <= max_lon:
             coords = []
             if "geometry" in d:
                 xs, ys = d["geometry"].xy
-                coords = list(zip(ys, xs))
+                # [변환] 선 좌표
+                lonlats = [transformer.transform(x, y) for x, y in zip(xs, ys)]
+                coords = [(lat, lon) for lon, lat in lonlats]
             else:
-                coords = [(uy, ux), (nodes[v]['y'], nodes[v]['x'])]
+                vx, vy = nodes[v]['x'], nodes[v]['y']
+                vlon, vlat = transformer.transform(vx, vy)
+                coords = [(ulat, ulon), (vlat, vlon)]
             
             dens = d.get("density_per_km", 0.0)
-            color = "#1a9641"
-            if dens < 5: color = "#d7191c"
-            elif dens < 15: color = "#fdae61"
+            color = "#1a9641" # Green
+            if dens < 5: color = "#d7191c" # Red
+            elif dens < 15: color = "#fdae61" # Orange
             
             segments.append({
                 "geometry": coords,
