@@ -20,20 +20,26 @@ logger = logging.getLogger("api")
 load_dotenv()
 
 # ---------------------------------------------------------
-# [1] 전역 그래프 로딩 (Lifespan)
+# [1] 전역 그래프 로딩 (수정된 부분)
 # ---------------------------------------------------------
+# 🚨 중요: lifespan 밖으로 꺼냅니다.
+# 이렇게 해야 Gunicorn 마스터 프로세스가 딱 한 번 실행하고, 워커들이 공유합니다.
+
+logger.info("🌍 [System] 서버 시작: 서울/인천 지도 로딩 중... (Pre-loading)")
+graph_manager.load_all_cities()  # <--- 여기로 이동!!!
+
+if not graph_manager.graphs:
+    logger.warning("🔥 [System] 로딩된 지도가 없습니다! (실시간 모드 작동)")
+else:
+    logger.info(f"✅ [System] 지도 로딩 완료. (공유 메모리 사용)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🌍 [System] 서버 시작: 서울/인천 지도 로딩 중... (3~5분 소요)")
-    
-    # 서버 켤 때 서울/인천을 메모리에 로딩
-    graph_manager.load_all_cities()
-    
-    if not graph_manager.graphs:
-        logger.warning("🔥 [System] 로딩된 지도가 없습니다! 모든 요청이 실시간 생성 모드로 작동합니다.")
-    
+    # 여기서는 DB 연결 같은 가벼운 것만 처리
+    logger.info("🚀 [Worker] 워커 프로세스 시작")
     yield
-    logger.info("👋 [System] 서버 종료: 메모리 해제")
+    logger.info("👋 [Worker] 워커 프로세스 종료")
 
 app = FastAPI(title="Safe Routing API", lifespan=lifespan)
 
