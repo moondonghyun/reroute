@@ -12,7 +12,7 @@ from decimal import Decimal
 import uuid
 import uvicorn
 
-# ★ [중요] ai_dynamic_routing 대신 model 로 변경됨
+# [중요] model.py에서 가져옴
 from model import run_pipeline, PipelineResult, graph_manager
 
 logging.basicConfig(level=logging.INFO)
@@ -26,11 +26,11 @@ load_dotenv()
 async def lifespan(app: FastAPI):
     logger.info("🌍 [System] 서버 시작: 서울/인천 지도 로딩 중... (3~5분 소요)")
     
-    # 여기서 서울과 인천을 모두 메모리에 올립니다.
+    # 서버 켤 때 서울/인천을 메모리에 로딩
     graph_manager.load_all_cities()
     
     if not graph_manager.graphs:
-        logger.error("🔥 [System] 로딩된 지도가 하나도 없습니다! 기능이 제한됩니다.")
+        logger.warning("🔥 [System] 로딩된 지도가 없습니다! 모든 요청이 실시간 생성 모드로 작동합니다.")
     
     yield
     logger.info("👋 [System] 서버 종료: 메모리 해제")
@@ -67,7 +67,6 @@ class RouteRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    # 로딩된 도시 목록 확인 가능
     loaded_cities = list(graph_manager.graphs.keys())
     return {"status": "ok", "loaded_cities": loaded_cities}
 
@@ -91,22 +90,17 @@ def save_route_history(item: dict):
 
 @app.post("/calculate-route")
 def calculate_route(req: RouteRequest, background_tasks: BackgroundTasks):
-    # 1. 사용자 위치에 맞는 그래프 가져오기 (서울 or 인천)
+    # 1. 사용자 위치에 맞는 그래프 가져오기 (서울/인천 or None)
     target_graph = graph_manager.get_graph(req.start_lat, req.start_lon)
 
-    if target_graph is None:
-        # 로딩이 안 됐거나 지원하지 않는 지역
-        if not graph_manager.graphs:
-            raise HTTPException(status_code=503, detail="Maps are still loading. Please wait.")
-        else:
-            raise HTTPException(status_code=404, detail="Service not available in this area (Only Seoul/Incheon).")
+    # target_graph가 None이어도 에러 아님 -> fallback으로 실시간 생성함
 
     try:
-        # 2. 경로 계산 (메모리 그래프 사용 -> 0.1초)
+        # 2. 경로 계산
         result = run_pipeline(
             req.start_lat, req.start_lon, req.end_lat, req.end_lon,
             app_key=os.getenv("TMAP_APP_KEY"),
-            preloaded_graph=target_graph  # <--- ★ 선택된 도시 그래프 전달
+            preloaded_graph=target_graph  # None이면 내부에서 실시간 로딩
         )
 
         # 3. 주변 시설물 필터링
