@@ -12,8 +12,8 @@ from decimal import Decimal
 import uuid
 import uvicorn
 
-# 수정된 모듈 임포트
-from model import run_pipeline, PipelineResult, load_static_graph
+# ★ [중요] ai_dynamic_routing 대신 model 로 변경됨
+from model import run_pipeline, PipelineResult, graph_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
@@ -22,25 +22,18 @@ load_dotenv()
 # ---------------------------------------------------------
 # [1] 전역 그래프 로딩 (Lifespan)
 # ---------------------------------------------------------
-GLOBAL_GRAPH = None
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global GLOBAL_GRAPH
-    logger.info("🌍 [System] 서버 시작: 인천 전체 지도 메모리 로딩 중... (약 1~2분 소요)")
+    logger.info("🌍 [System] 서버 시작: 서울/인천 지도 로딩 중... (3~5분 소요)")
     
-    # 인천 시청 기준 반경 12km (인천 서구, 남동구, 부평구, 연수구 대부분 커버)
-    # t3.xlarge (16GB RAM) 사용 시 약 2~4GB 소모 예상
-    try:
-        GLOBAL_GRAPH = load_static_graph(center_lat=37.4563, center_lon=126.7052, dist_m=12000)
-        logger.info(f"✅ [System] 지도 로딩 완료! (Nodes: {len(GLOBAL_GRAPH.nodes)}, Edges: {len(GLOBAL_GRAPH.edges)})")
-    except Exception as e:
-        logger.error(f"🔥 [System] 지도 로딩 실패: {e}")
-        GLOBAL_GRAPH = None
+    # 여기서 서울과 인천을 모두 메모리에 올립니다.
+    graph_manager.load_all_cities()
+    
+    if not graph_manager.graphs:
+        logger.error("🔥 [System] 로딩된 지도가 하나도 없습니다! 기능이 제한됩니다.")
     
     yield
-    GLOBAL_GRAPH = None
-    logger.info("👋 [System] 서버 종료: 메모리 해제 완료")
+    logger.info("👋 [System] 서버 종료: 메모리 해제")
 
 app = FastAPI(title="Safe Routing API", lifespan=lifespan)
 
@@ -74,15 +67,14 @@ class RouteRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    # 그래프가 로딩되었는지 상태 확인 가능
-    status = "ok" if GLOBAL_GRAPH else "loading_map"
-    return {"status": status}
+    # 로딩된 도시 목록 확인 가능
+    loaded_cities = list(graph_manager.graphs.keys())
+    return {"status": "ok", "loaded_cities": loaded_cities}
 
 # ---------------------------------------------------------
 # [3] 메인 API
 # ---------------------------------------------------------
 def filter_features_in_bbox(features, min_lat, max_lat, min_lon, max_lon):
-    """BBox 내 시설물 필터링"""
     result = []
     for item in features:
         try:
@@ -99,19 +91,25 @@ def save_route_history(item: dict):
 
 @app.post("/calculate-route")
 def calculate_route(req: RouteRequest, background_tasks: BackgroundTasks):
-    # 전역 그래프가 로딩 중이면 503 에러 반환 (Service Unavailable)
-    if GLOBAL_GRAPH is None:
-        raise HTTPException(status_code=503, detail="Server is initializing the map. Please try again in a minute.")
+    # 1. 사용자 위치에 맞는 그래프 가져오기 (서울 or 인천)
+    target_graph = graph_manager.get_graph(req.start_lat, req.start_lon)
+
+    if target_graph is None:
+        # 로딩이 안 됐거나 지원하지 않는 지역
+        if not graph_manager.graphs:
+            raise HTTPException(status_code=503, detail="Maps are still loading. Please wait.")
+        else:
+            raise HTTPException(status_code=404, detail="Service not available in this area (Only Seoul/Incheon).")
 
     try:
-        # 1. 경로 계산 (메모리에 있는 그래프 사용 -> 0.1초 컷)
+        # 2. 경로 계산 (메모리 그래프 사용 -> 0.1초)
         result = run_pipeline(
             req.start_lat, req.start_lon, req.end_lat, req.end_lon,
             app_key=os.getenv("TMAP_APP_KEY"),
-            preloaded_graph=GLOBAL_GRAPH  # <--- ★ 핵심: 미리 만든 그래프 전달
+            preloaded_graph=target_graph  # <--- ★ 선택된 도시 그래프 전달
         )
 
-        # 2. 주변 시설물 필터링 (Bounding Box)
+        # 3. 주변 시설물 필터링
         pad = 0.002
         min_lat, max_lat = min(req.start_lat, req.end_lat) - pad, max(req.start_lat, req.end_lat) + pad
         min_lon, max_lon = min(req.start_lon, req.end_lon) - pad, max(req.start_lon, req.end_lon) + pad
@@ -129,11 +127,11 @@ def calculate_route(req: RouteRequest, background_tasks: BackgroundTasks):
             "grid_visualization": result.visual_segments
         }
 
-        # 3. DB 저장
+        # 4. DB 저장
         # if route_table:
         #     item = {
         #         "route_id": str(uuid.uuid4()),
-        #         "user_id": "99999", # Test ID
+        #         "user_id": "99999",
         #         "timestamp": int(time.time()),
         #         "created_at": datetime.now().isoformat(),
         #         "start_point": {"lat": Decimal(str(req.start_lat)), "lon": Decimal(str(req.start_lon))},
