@@ -13,7 +13,7 @@ import uuid
 import uvicorn
 
 # 수정된 모듈 임포트
-from ai_dynamic_routing import run_pipeline, PipelineResult, load_static_graph
+from model import run_pipeline, PipelineResult, load_static_graph
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
