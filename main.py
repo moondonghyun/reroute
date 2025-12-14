@@ -155,6 +155,7 @@ def calculate_route(
             item = {
                 "route_id": str(uuid.uuid4()),
                 "user_sub": user_sub,
+                "isSaved": false,
                 "timestamp": int(time.time()),
                 "created_at": datetime.now().isoformat(),
                 "start_point": {"lat": Decimal(str(req.start_lat)), "lon": Decimal(str(req.start_lon))},
