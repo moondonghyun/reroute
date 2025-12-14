@@ -14,6 +14,7 @@ import uuid
 import uvicorn
 from jose import jwt
 
+# model.py에서 가져옴
 from model import run_pipeline, PipelineResult, graph_manager
 
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +22,24 @@ logger = logging.getLogger("api")
 load_dotenv()
 
 # ---------------------------------------------------------
-# [1] 전역 그래프 로딩 (Lifespan)
+# [1] 설정 (S3 버킷 이름 설정 필수!)
+# ---------------------------------------------------------
+BUCKET_NAME = "inha-capstone-11-bucket" 
+REGION_NAME = "us-west-2"           
+
+# AWS 리소스 연결
+try:
+    dynamodb = boto3.resource('dynamodb', region_name=REGION_NAME)
+    route_table = dynamodb.Table('inha-capstone-11-nosql')
+    s3_client = boto3.client('s3', region_name=REGION_NAME)
+    logger.info("✅ AWS DynamoDB & S3 Connected.")
+except Exception as e:
+    logger.error(f"⚠️ AWS Connection Error: {e}")
+    route_table = None
+    s3_client = None
+
+# ---------------------------------------------------------
+# [2] 전역 그래프 로딩
 # ---------------------------------------------------------
 logger.info("🌍 [System] 서버 시작: 서울/인천 지도 로딩 중... (Pre-loading)")
 graph_manager.load_all_cities()
@@ -30,7 +48,6 @@ if not graph_manager.graphs:
     logger.warning("🔥 [System] 로딩된 지도가 없습니다! (실시간 모드 작동)")
 else:
     logger.info(f"✅ [System] 지도 로딩 완료. (공유 메모리 사용)")
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,29 +58,23 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Safe Routing API", lifespan=lifespan)
 
 # ---------------------------------------------------------
-# [2] 인증(Auth) 로직
+# [3] 인증 및 유틸리티
 # ---------------------------------------------------------
 security = HTTPBearer()
 
 def get_current_user_sub(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     try:
-        # 페이로드만 추출합니다. (AWS Cognito가 발급했다고 가정)
+        # 서명 검증 없이 페이로드의 sub만 추출 (프로덕션에선 verify=True 권장)
         payload = jwt.get_unverified_claims(token)
         user_sub = payload.get("sub")
-        
         if not user_sub:
-            raise HTTPException(status_code=401, detail="Token does not contain 'sub'")
-            
+            raise HTTPException(status_code=401, detail="Token missing 'sub'")
         return user_sub
     except Exception as e:
-        logger.error(f"Token parsing error: {e}")
-        raise HTTPException(status_code=401, detail="Invalid Authentication Token")
+        logger.error(f"Token error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid Token")
 
-
-# ---------------------------------------------------------
-# [3] 정적 데이터 및 AWS 설정
-# ---------------------------------------------------------
 def load_json_data(filename):
     try:
         with open(filename, 'r', encoding='utf-8') as f: return json.load(f)
@@ -73,13 +84,8 @@ STREETLIGHTS = load_json_data("streetlight.json")
 CCTVS = load_json_data("cctv.json")
 POLICE_STATIONS = load_json_data("police_station.json")
 
-route_table = None
-try:
-    dynamodb = boto3.resource('dynamodb', region_name='us-west-2')
-    route_table = dynamodb.Table('inha-capstone-11-nosql')
-except: pass
-
 def float_to_decimal(data):
+    # DynamoDB 저장을 위해 float -> Decimal 변환
     return json.loads(json.dumps(data), parse_float=Decimal)
 
 class RouteRequest(BaseModel):
@@ -91,11 +97,48 @@ class RouteRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    loaded_cities = list(graph_manager.graphs.keys())
-    return {"status": "ok", "loaded_cities": loaded_cities}
+    return {"status": "ok", "loaded_cities": list(graph_manager.graphs.keys())}
 
 # ---------------------------------------------------------
-# [4] 메인 API
+# [4] 저장 로직 (S3 + DynamoDB)
+# ---------------------------------------------------------
+def save_route_to_s3_and_db(metadata: dict, heavy_data: dict):
+    """
+    백그라운드에서 실행되는 함수:
+    1. 무거운 데이터(경로, 시각화)는 S3에 JSON으로 업로드
+    2. 메타데이터(ID, 시간, 좌표, S3링크)는 DynamoDB에 저장
+    """
+    if not route_table or not s3_client:
+        return
+
+    user_id = metadata['user_id']
+    route_id = metadata['route_id']
+    
+    try:
+        # [Step 1] S3 업로드
+        s3_key = f"routes/{user_id}/{route_id}.json"
+        
+        s3_client.put_object(
+            Bucket=BUCKET_NAME,
+            Key=s3_key,
+            Body=json.dumps(heavy_data, ensure_ascii=False), # 한글 깨짐 방지
+            ContentType='application/json'
+        )
+        logger.info(f"☁️ S3 Upload Success: {s3_key}")
+
+        # [Step 2] DynamoDB 저장 (S3 키 포함)
+        metadata['s3_key'] = s3_key
+        
+        # float -> Decimal 변환 후 저장
+        route_table.put_item(Item=float_to_decimal(metadata))
+        logger.info(f"💾 DynamoDB Save Success: {route_id}")
+
+    except Exception as e:
+        logger.error(f"🔥 Save Failed: {str(e)}")
+
+
+# ---------------------------------------------------------
+# [5] 메인 API
 # ---------------------------------------------------------
 def filter_features_in_bbox(features, min_lat, max_lat, min_lon, max_lon):
     result = []
@@ -107,36 +150,28 @@ def filter_features_in_bbox(features, min_lat, max_lat, min_lon, max_lon):
         except: continue
     return result
 
-def save_route_history(item: dict):
-    if route_table:
-        try: 
-            route_table.put_item(Item=item)
-            logger.info(f"💾 Saved route history for user: {item['user_id']}")
-        except Exception as e: 
-            logger.error(f"DB Error: {e}")
-
 @app.post("/calculate-route")
 def calculate_route(
     req: RouteRequest, 
     background_tasks: BackgroundTasks,
-    user_sub: str = Depends(get_current_user_sub) # [★] 여기서 토큰 검사 및 sub 추출
+    user_sub: str = Depends(get_current_user_sub)
 ):
-    # 1. 사용자 위치에 맞는 그래프 가져오기 (서울/인천 or None)
     target_graph = graph_manager.get_graph(req.start_lat, req.start_lon)
 
     try:
-        # 2. 경로 계산
+        # 1. 경로 계산
         result = run_pipeline(
             req.start_lat, req.start_lon, req.end_lat, req.end_lon,
             app_key=os.getenv("TMAP_APP_KEY"),
             preloaded_graph=target_graph
         )
 
-        # 3. 주변 시설물 필터링
+        # 2. 주변 시설물 필터링
         pad = 0.002
         min_lat, max_lat = min(req.start_lat, req.end_lat) - pad, max(req.start_lat, req.end_lat) + pad
         min_lon, max_lon = min(req.start_lon, req.end_lon) - pad, max(req.start_lon, req.end_lon) + pad
         
+        # [Client 응답용 전체 데이터]
         response_data = {
             "base_route": result.base_route,
             "rerouted": result.rerouted,
@@ -150,24 +185,32 @@ def calculate_route(
             "grid_visualization": result.visual_segments
         }
 
-        # 4. DB 저장
-        if route_table:
-            item = {
-                "route_id": str(uuid.uuid4()),
-                "user_sub": user_sub,
-                "isSaved": False,
+        # 3. 백그라운드 저장 요청 (S3 Offloading)
+        if route_table and s3_client:
+            route_id = str(uuid.uuid4())
+            
+            # (A) DynamoDB에 들어갈 가벼운 메타데이터
+            meta_data = {
+                "route_id": route_id,
+                "user_id": user_sub,      # Partition Key
+                "isSaved": False,         # Boolean (False)
                 "timestamp": int(time.time()),
                 "created_at": datetime.now().isoformat(),
-                "start_point": {"lat": Decimal(str(req.start_lat)), "lon": Decimal(str(req.start_lon))},
-                "end_point": {"lat": Decimal(str(req.end_lat)), "lon": Decimal(str(req.end_lon))},
-                "route_data": float_to_decimal(response_data)
+                "start_point": {"lat": req.start_lat, "lon": req.start_lon}, # Decimal 변환 전
+                "end_point": {"lat": req.end_lat, "lon": req.end_lon}        # Decimal 변환 전
             }
-            background_tasks.add_task(save_route_history, item)
+            
+            # (B) S3에 들어갈 무거운 데이터 (전체)
+            heavy_data = response_data
+            
+            # 백그라운드 작업 추가
+            background_tasks.add_task(save_route_to_s3_and_db, meta_data, heavy_data)
 
+        # Client에게는 데이터 바로 반환
         return response_data
 
     except HTTPException as he:
-        raise he # Auth 에러 등은 그대로 전달
+        raise he
     except Exception as e:
         logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
