@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import os
@@ -11,8 +12,8 @@ from datetime import datetime
 from decimal import Decimal
 import uuid
 import uvicorn
+from jose import jwt
 
-# [중요] model.py에서 가져옴
 from model import run_pipeline, PipelineResult, graph_manager
 
 logging.basicConfig(level=logging.INFO)
@@ -20,13 +21,10 @@ logger = logging.getLogger("api")
 load_dotenv()
 
 # ---------------------------------------------------------
-# [1] 전역 그래프 로딩 (수정된 부분)
+# [1] 전역 그래프 로딩 (Lifespan)
 # ---------------------------------------------------------
-# 🚨 중요: lifespan 밖으로 꺼냅니다.
-# 이렇게 해야 Gunicorn 마스터 프로세스가 딱 한 번 실행하고, 워커들이 공유합니다.
-
 logger.info("🌍 [System] 서버 시작: 서울/인천 지도 로딩 중... (Pre-loading)")
-graph_manager.load_all_cities()  # <--- 여기로 이동!!!
+graph_manager.load_all_cities()
 
 if not graph_manager.graphs:
     logger.warning("🔥 [System] 로딩된 지도가 없습니다! (실시간 모드 작동)")
@@ -36,7 +34,6 @@ else:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 여기서는 DB 연결 같은 가벼운 것만 처리
     logger.info("🚀 [Worker] 워커 프로세스 시작")
     yield
     logger.info("👋 [Worker] 워커 프로세스 종료")
@@ -44,7 +41,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Safe Routing API", lifespan=lifespan)
 
 # ---------------------------------------------------------
-# [2] 정적 데이터 및 AWS 설정
+# [2] 인증(Auth) 로직
+# ---------------------------------------------------------
+security = HTTPBearer()
+
+def get_current_user_sub(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        # 페이로드만 추출합니다. (AWS Cognito가 발급했다고 가정)
+        payload = jwt.get_unverified_claims(token)
+        user_sub = payload.get("sub")
+        
+        if not user_sub:
+            raise HTTPException(status_code=401, detail="Token does not contain 'sub'")
+            
+        return user_sub
+    except Exception as e:
+        logger.error(f"Token parsing error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid Authentication Token")
+
+
+# ---------------------------------------------------------
+# [3] 정적 데이터 및 AWS 설정
 # ---------------------------------------------------------
 def load_json_data(filename):
     try:
@@ -57,7 +75,7 @@ POLICE_STATIONS = load_json_data("police_station.json")
 
 route_table = None
 try:
-    dynamodb = boto3.resource('dynamodb', region_name='ap-northeast-2')
+    dynamodb = boto3.resource('dynamodb', region_name='us-west-2')
     route_table = dynamodb.Table('inha-capstone-11-nosql')
 except: pass
 
@@ -77,7 +95,7 @@ def health_check():
     return {"status": "ok", "loaded_cities": loaded_cities}
 
 # ---------------------------------------------------------
-# [3] 메인 API
+# [4] 메인 API
 # ---------------------------------------------------------
 def filter_features_in_bbox(features, min_lat, max_lat, min_lon, max_lon):
     result = []
@@ -91,22 +109,27 @@ def filter_features_in_bbox(features, min_lat, max_lat, min_lon, max_lon):
 
 def save_route_history(item: dict):
     if route_table:
-        try: route_table.put_item(Item=item)
-        except Exception as e: logger.error(f"DB Error: {e}")
+        try: 
+            route_table.put_item(Item=item)
+            logger.info(f"💾 Saved route history for user: {item['user_id']}")
+        except Exception as e: 
+            logger.error(f"DB Error: {e}")
 
 @app.post("/calculate-route")
-def calculate_route(req: RouteRequest, background_tasks: BackgroundTasks):
+def calculate_route(
+    req: RouteRequest, 
+    background_tasks: BackgroundTasks,
+    user_sub: str = Depends(get_current_user_sub) # [★] 여기서 토큰 검사 및 sub 추출
+):
     # 1. 사용자 위치에 맞는 그래프 가져오기 (서울/인천 or None)
     target_graph = graph_manager.get_graph(req.start_lat, req.start_lon)
-
-    # target_graph가 None이어도 에러 아님 -> fallback으로 실시간 생성함
 
     try:
         # 2. 경로 계산
         result = run_pipeline(
             req.start_lat, req.start_lon, req.end_lat, req.end_lon,
             app_key=os.getenv("TMAP_APP_KEY"),
-            preloaded_graph=target_graph  # None이면 내부에서 실시간 로딩
+            preloaded_graph=target_graph
         )
 
         # 3. 주변 시설물 필터링
@@ -128,20 +151,22 @@ def calculate_route(req: RouteRequest, background_tasks: BackgroundTasks):
         }
 
         # 4. DB 저장
-        # if route_table:
-        #     item = {
-        #         "route_id": str(uuid.uuid4()),
-        #         "user_id": "99999",
-        #         "timestamp": int(time.time()),
-        #         "created_at": datetime.now().isoformat(),
-        #         "start_point": {"lat": Decimal(str(req.start_lat)), "lon": Decimal(str(req.start_lon))},
-        #         "end_point": {"lat": Decimal(str(req.end_lat)), "lon": Decimal(str(req.end_lon))},
-        #         "route_data": float_to_decimal(response_data)
-        #     }
-        #     background_tasks.add_task(save_route_history, item)
+        if route_table:
+            item = {
+                "route_id": str(uuid.uuid4()),
+                "user_sub": user_sub,
+                "timestamp": int(time.time()),
+                "created_at": datetime.now().isoformat(),
+                "start_point": {"lat": Decimal(str(req.start_lat)), "lon": Decimal(str(req.start_lon))},
+                "end_point": {"lat": Decimal(str(req.end_lat)), "lon": Decimal(str(req.end_lon))},
+                "route_data": float_to_decimal(response_data)
+            }
+            background_tasks.add_task(save_route_history, item)
 
         return response_data
 
+    except HTTPException as he:
+        raise he # Auth 에러 등은 그대로 전달
     except Exception as e:
         logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
