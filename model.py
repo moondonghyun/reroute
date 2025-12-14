@@ -23,7 +23,7 @@ from pyproj import Transformer  # [★] 좌표 변환을 위한 필수 라이브
 
 # ------------------------ Settings ------------------------ #
 TMAP_API_URL = "https://apis.openapi.sk.com/tmap/routes/pedestrian"
-TMAP_APP_KEY = os.getenv("TMAP_APP_KEY", "IqFRypKZ8h81kp9xXLyKY5OfY9PwYSxi8K2pHLkb")
+TMAP_APP_KEY = os.getenv("TMAP_APP_KEY")
 TMAP_TIMEOUT = 15
 
 # [설정] 미리 메모리에 올릴 도시 (Fast Mode 지원 지역)
@@ -31,7 +31,7 @@ TMAP_TIMEOUT = 15
 CITIES_CONFIG = {
     "incheon": {"lat": 37.4563, "lon": 126.7052, "dist": 12000}, # 인천 반경 12km
     "seoul":   {"lat": 37.5665, "lon": 126.9780, "dist": 15000}, # 서울 반경 15km
-    # "suwon": {"lat": 37.2636, "lon": 127.0286, "dist": 10000}, # (선택사항)
+    "suwon": {"lat": 37.2636, "lon": 127.0286, "dist": 10000}, # (선택사항)
 }
 
 NETWORK_TYPE = "walk"
@@ -446,3 +446,4 @@ def extract_visual_segments_bbox(G, slat, slon, elat, elon, transformer, padding
             })
             
     return segments
+
