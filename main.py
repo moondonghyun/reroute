@@ -172,7 +172,9 @@ def calculate_route(
         min_lon, max_lon = min(req.start_lon, req.end_lon) - pad, max(req.start_lon, req.end_lon) + pad
         
         # [Client 응답용 전체 데이터]
+        route_id = str(uuid.uuid4())
         response_data = {
+            "route_id": route_id,
             "base_route": result.base_route,
             "rerouted": result.rerouted,
             "base_weight": result.base_weight,
@@ -187,8 +189,6 @@ def calculate_route(
 
         # 3. 백그라운드 저장 요청 (S3 Offloading)
         if route_table and s3_client:
-            route_id = str(uuid.uuid4())
-            
             # (A) DynamoDB에 들어갈 가벼운 메타데이터
             meta_data = {
                 "route_id": route_id,
