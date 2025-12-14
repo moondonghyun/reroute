@@ -27,9 +27,9 @@ TMAP_TIMEOUT = 15
 
 # [설정] 미리 메모리에 올릴 도시 (반경 축소 권장: 로딩 속도 및 정밀도 향상)
 CITIES_CONFIG = {
-    "incheon": {"lat": 37.4563, "lon": 126.7052, "dist": 5000}, 
-    "seoul":   {"lat": 37.5665, "lon": 126.9780, "dist": 5000},
-    "suwon":   {"lat": 37.2636, "lon": 127.0286, "dist": 5000},
+    "incheon": {"lat": 37.4563, "lon": 126.7052, "dist": 12000}, 
+    "seoul":   {"lat": 37.5665, "lon": 126.9780, "dist": 15000},
+    # "suwon":   {"lat": 37.2636, "lon": 127.0286, "dist": 15000},
 }
 
 NETWORK_TYPE = "walk"
@@ -458,3 +458,4 @@ def extract_visual_segments_bbox(G, slat, slon, elat, elon, padding=0.005):
             })
             
     return segments
+
