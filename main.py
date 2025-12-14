@@ -194,6 +194,8 @@ def calculate_route(
                 "route_id": route_id,
                 "user_id": user_sub,      # Partition Key
                 "isSaved": False,         # Boolean (False)
+                "start_name": req.start_name,
+                "end_name": req.end_name,
                 "timestamp": int(time.time()),
                 "created_at": datetime.now().isoformat(),
                 "start_point": {"lat": req.start_lat, "lon": req.start_lon}, # Decimal 변환 전
