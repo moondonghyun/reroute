@@ -29,7 +29,7 @@ TMAP_TIMEOUT = 15
 CITIES_CONFIG = {
     "incheon": {"lat": 37.4563, "lon": 126.7052, "dist": 5000}, 
     "seoul":   {"lat": 37.5665, "lon": 126.9780, "dist": 5000},
-    "suwon":   {"lat": 37.2636, "lon": 127.0286, "dist": 5000},
+    # "suwon":   {"lat": 37.2636, "lon": 127.0286, "dist": 5000},
 }
 
 NETWORK_TYPE = "walk"
@@ -241,11 +241,20 @@ def load_static_graph(center_lat, center_lon, dist_m):
     # 1. Lat/Lon 그래프 생성
     G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="walk", simplify=True)
     
-    # [수정 1] 고립된 노드 제거 (가장 큰 연결 덩어리만 남김)
-    # 이걸 해야 펜스 쳐진 아파트 단지 안쪽 노드에 잘못 매칭되어 빙 도는 문제를 막음
+    # [수정] OSMnx 버전 호환성 처리 (v2.0 vs v1.x)
+    # 고립된 노드 제거 (가장 큰 연결 덩어리만 남김)
     if len(G) > 0:
-        G = ox.utils_graph.get_largest_component(G, strongly=True)
-    
+        try:
+            # OSMnx 2.0.0 이상 (새로운 방식)
+            G = ox.truncate.largest_component(G, strongly=True)
+        except AttributeError:
+            # OSMnx 1.x 이하 (기존 방식)
+            try:
+                G = ox.utils_graph.get_largest_component(G, strongly=True)
+            except AttributeError:
+                # 혹시 모를 구버전 대비 (직접 접근 실패 시 패스하거나 다른 alias 시도)
+                pass
+
     # 2. 가중치 계산
     apply_weights_to_graph(G)
     update_graph_with_model(G, MODEL_PATH, resolve_hour("now"), ALPHA)
@@ -412,3 +421,4 @@ def extract_visual_segments_bbox(G, slat, slon, elat, elon, padding=0.005):
                 "properties": {"density": dens}
             })
     return segments
+
