@@ -63,22 +63,34 @@ def utm_epsg_from_latlon(lat: float, lon: float) -> int:
 # (기존 데이터 로딩 함수들 유지)
 def load_cctv_points(path: str) -> gpd.GeoDataFrame:
     if not os.path.exists(path):
-        return gpd.GeoDataFrame(columns=["camera_count", "geometry"], geometry=[], crs="EPSG:4326")
+        # 빈 데이터프레임 반환 시에도 count 컬럼 명시
+        return gpd.GeoDataFrame(columns=["camera_count", "count", "geometry"], geometry=[], crs="EPSG:4326")
+    
     df = pd.read_excel(path)
     df.columns = df.columns.str.strip()
+    
     def pick(cands):
         for c in cands:
             if c in df.columns: return c
         return None
+    
     lat_col = pick(["위도", "lat", "latitude"])
     lon_col = pick(["경도", "lon", "longitude"])
     cnt_col = pick(["카메라대수", "camera_count", "count"]) or "camera_count"
+    
     if not lat_col or not lon_col:
-        return gpd.GeoDataFrame(columns=["camera_count", "geometry"], geometry=[], crs="EPSG:4326")
-    if cnt_col not in df.columns: df[cnt_col] = 1
+        return gpd.GeoDataFrame(columns=["camera_count", "count", "geometry"], geometry=[], crs="EPSG:4326")
+    
+    if cnt_col not in df.columns: 
+        df[cnt_col] = 1
+        
     df[cnt_col] = pd.to_numeric(df[cnt_col], errors="coerce").fillna(1)
+    
     gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df[lon_col], df[lat_col]), crs="EPSG:4326")
     gdf = gdf.rename(columns={cnt_col: "camera_count"})
+    
+    gdf["count"] = gdf["camera_count"]
+    
     return gdf
 
 def load_generic_points(path: str) -> gpd.GeoDataFrame:
@@ -357,3 +369,4 @@ def extract_visual_segments_bbox(G, slat, slon, elat, elon, padding=0.005):
                 "properties": {"density": dens}
             })
     return segments
+
