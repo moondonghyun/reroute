@@ -93,6 +93,8 @@ class RouteRequest(BaseModel):
     start_lon: float
     end_lat: float
     end_lon: float
+    start_name: str
+    end_name: str
     hour: str = "now"
 
 @app.get("/health")
