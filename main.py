@@ -167,9 +167,9 @@ def calculate_route(
         result = run_pipeline(
             req.start_lat, req.start_lon, req.end_lat, req.end_lon,
             app_key=os.getenv("TMAP_APP_KEY"),
-            cctv_df=GDF_CCTV, 
-            light_df=GDF_LIGHT,
-            police_df=GDF_POLICE
+            gdf_cctv=GDF_CCTV,   
+            gdf_light=GDF_LIGHT, 
+            gdf_police=GDF_POLICE
         )
 
         # 2. 주변 시설물 필터링
