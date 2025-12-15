@@ -27,6 +27,7 @@ load_dotenv()
 BUCKET_NAME = "inha-capstone-11-bucket" 
 REGION_NAME = "us-west-2"           
 
+
 # AWS 리소스 연결
 try:
     dynamodb = boto3.resource('dynamodb', region_name=REGION_NAME)
@@ -46,22 +47,20 @@ GDF_CCTV = None
 GDF_LIGHT = None
 GDF_POLICE = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global GDF_CCTV, GDF_LIGHT, GDF_POLICE
-    logger.info("🚀 [Startup] 데이터 로딩 시작...")
-    
-    # 1. 여기서 엑셀/CSV를 한 번만 읽습니다.
-    # (주의: model.py의 load 함수들을 재활용하거나 직접 작성)
+try:
     GDF_CCTV = load_cctv_points("cctv_data.xlsx")
     GDF_LIGHT = safe_load_generic_points("nationwide_streetlight.xlsx", "streetlight")
     GDF_POLICE = load_police_points("Police_station.csv")
-    
-    # 2. (옵션) 자주 쓰는 지역의 그래프(G)도 미리 로드해두면 베스트입니다.
-    
-    logger.info("✅ [Startup] 데이터 로딩 완료!")
+    logger.info("✅ [Master] 데이터 로딩 완료!")
+except Exception as e:
+    logger.error(f"❌ 데이터 로딩 실패: {e}")
+    GDF_CCTV, GDF_LIGHT, GDF_POLICE = None, None, None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 [Worker] 워커 프로세스 시작 (데이터는 이미 로드됨)")
     yield
-    logger.info("👋 [Shutdown] 서버 종료")
+    logger.info("👋 [Worker] 워커 프로세스 종료")
 
 app = FastAPI(title="Safe Routing API", lifespan=lifespan)
 
