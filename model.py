@@ -467,9 +467,9 @@ def load_police_points(path: str) -> gpd.GeoDataFrame:
 
 def apply_cctv_weights(
     G: nx.MultiDiGraph,
-    cctv_path: str = CCTV_XLSX,
-    streetlight_path: str = STREETLIGHT_PATH,
-    police_path: str = POLICE_PATH,
+    gdf_cctv: gpd.GeoDataFrame,
+    gdf_light: gpd.GeoDataFrame,
+    gdf_police: gpd.GeoDataFrame,
     radius_m: float = 80.0,
     alpha: float = ALPHA,
 ) -> None:
@@ -482,9 +482,9 @@ def apply_cctv_weights(
     edges_utm = edges.to_crs(epsg=epsg)
     edges_utm["length_m"] = edges_utm["length"] if "length" in edges_utm.columns else edges_utm.length
 
-    cctv = load_cctv_points(cctv_path).to_crs(epsg=epsg)
-    street = safe_load_generic_points(streetlight_path, "streetlight").to_crs(epsg=epsg)
-    police = load_police_points(police_path).to_crs(epsg=epsg)
+    cctv = gdf_cctv.to_crs(epsg=epsg)
+    street = gdf_light.to_crs(epsg=epsg)
+    police = gdf_police.to_crs(epsg=epsg)
     edges_buf = edges_utm[["u", "v", "key", "geometry"]].copy()
     edges_buf["geometry"] = edges_buf.buffer(radius_m)
 
@@ -735,9 +735,9 @@ def run_pipeline(
     *,
     app_key: str = TMAP_APP_KEY,
     margin_m: float = MARGIN_M,
-    cctv_path: str = CCTV_XLSX,
-    streetlight_path: str = STREETLIGHT_PATH,
-    police_path: str = POLICE_PATH,
+    gdf_cctv: gpd.GeoDataFrame,
+    gdf_light: gpd.GeoDataFrame,
+    gdf_police: gpd.GeoDataFrame
     model_path: str = "",
     alpha: float = ALPHA,
     hour: Any = HOUR_DEFAULT,
@@ -752,9 +752,9 @@ def run_pipeline(
     log("[3/5] Inject CCTV density")
     apply_cctv_weights(
         G,
-        cctv_path=cctv_path,
-        streetlight_path=streetlight_path,
-        police_path=police_path,
+        gdf_cctv=gdf_cctv,
+        gdf_light=gdf_light,
+        gdf_police=gdf_police,
         radius_m=80.0,
         alpha=alpha,
     )
@@ -983,5 +983,6 @@ if __name__ == "__main__":
         out_html=MAIN_OUT_HTML,
         visualize=MAIN_VISUALIZE,
     )
+
 
 
