@@ -172,12 +172,27 @@ def calculate_route(
             gdf_police=GDF_POLICE,
             model_path="edge_pref_model_dataset.json"
         )
-
-        # 2. 주변 시설물 필터링
-        pad = 0.002
-        min_lat, max_lat = min(req.start_lat, req.end_lat) - pad, max(req.start_lat, req.end_lat) + pad
-        min_lon, max_lon = min(req.start_lon, req.end_lon) - pad, max(req.start_lon, req.end_lon) + pad
         
+        # 2. 주변 시설물 필터링
+        all_coords = result.base_route + result.rerouted
+        
+        if not all_coords:
+            # 만약 경로가 아예 없다면 출발/도착지만 사용 (예외 처리)
+            all_coords = [(req.start_lat, req.start_lon), (req.end_lat, req.end_lon)]
+
+        # 모든 좌표에서 min/max 추출
+        lats = [p[0] for p in all_coords]
+        lons = [p[1] for p in all_coords]
+
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+
+        # 여유 공간 (Padding) 추가 (약 200m 정도)
+        pad = 0.002
+        min_lat -= pad
+        max_lat += pad
+        min_lon -= pad
+        max_lon += pad
         # [Client 응답용 전체 데이터]
         route_id = str(uuid.uuid4())
         response_data = {
