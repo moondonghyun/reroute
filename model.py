@@ -737,7 +737,7 @@ def run_pipeline(
     margin_m: float = MARGIN_M,
     gdf_cctv: gpd.GeoDataFrame,
     gdf_light: gpd.GeoDataFrame,
-    gdf_police: gpd.GeoDataFrame
+    gdf_police: gpd.GeoDataFrame,
     model_path: str = "",
     alpha: float = ALPHA,
     hour: Any = HOUR_DEFAULT,
@@ -983,6 +983,7 @@ if __name__ == "__main__":
         out_html=MAIN_OUT_HTML,
         visualize=MAIN_VISUALIZE,
     )
+
 
 
 
