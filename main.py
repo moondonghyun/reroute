@@ -15,7 +15,7 @@ import uvicorn
 from jose import jwt
 
 # model.py에서 가져옴
-from model import run_pipeline, PipelineResult
+from model import run_pipeline, PipelineResult, load_cctv_points, safe_load_generic_points, load_police_points
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
@@ -42,11 +42,26 @@ except Exception as e:
 # [2] 전역 그래프 로딩
 # ---------------------------------------------------------
 
+GDF_CCTV = None
+GDF_LIGHT = None
+GDF_POLICE = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 [Worker] 워커 프로세스 시작")
+    global GDF_CCTV, GDF_LIGHT, GDF_POLICE
+    logger.info("🚀 [Startup] 데이터 로딩 시작...")
+    
+    # 1. 여기서 엑셀/CSV를 한 번만 읽습니다.
+    # (주의: model.py의 load 함수들을 재활용하거나 직접 작성)
+    GDF_CCTV = load_cctv_points("cctv_data.xlsx")
+    GDF_LIGHT = safe_load_generic_points("nationwide_streetlight.xlsx", "streetlight")
+    GDF_POLICE = load_police_points("Police_station.csv")
+    
+    # 2. (옵션) 자주 쓰는 지역의 그래프(G)도 미리 로드해두면 베스트입니다.
+    
+    logger.info("✅ [Startup] 데이터 로딩 완료!")
     yield
-    logger.info("👋 [Worker] 워커 프로세스 종료")
+    logger.info("👋 [Shutdown] 서버 종료")
 
 app = FastAPI(title="Safe Routing API", lifespan=lifespan)
 
@@ -153,6 +168,9 @@ def calculate_route(
         result = run_pipeline(
             req.start_lat, req.start_lon, req.end_lat, req.end_lon,
             app_key=os.getenv("TMAP_APP_KEY"),
+            cctv_df=GDF_CCTV, 
+            light_df=GDF_LIGHT,
+            police_df=GDF_POLICE
         )
 
         # 2. 주변 시설물 필터링
