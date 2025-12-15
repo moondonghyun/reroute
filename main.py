@@ -169,7 +169,8 @@ def calculate_route(
             app_key=os.getenv("TMAP_APP_KEY"),
             gdf_cctv=GDF_CCTV,   
             gdf_light=GDF_LIGHT, 
-            gdf_police=GDF_POLICE
+            gdf_police=GDF_POLICE,
+            model_path="edge_pref_model_dataset.json"
         )
 
         # 2. 주변 시설물 필터링
