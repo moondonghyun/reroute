@@ -17,7 +17,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Optional, Union
 
 import geopandas as gpd
 import networkx as nx
@@ -707,8 +707,8 @@ class PipelineResult:
     rerouted: List[Tuple[float, float]]
     base_weight: float
     rerouted_weight: float
-    html_path: str | None = None
-    visual_segments: List[Dict[str, Any]] | None = None
+    html_path: Optional[str] = None
+    visual_segments: Optional[List[Dict[str, Any]]] = None
 
 
 def build_graph_from_route(route_coords: Sequence[Tuple[float, float]], margin_m: float = MARGIN_M) -> nx.MultiDiGraph:
@@ -741,7 +741,7 @@ def run_pipeline(
     model_path: str = "",
     alpha: float = ALPHA,
     hour: Any = HOUR_DEFAULT,
-    html_out: str | None = None,
+    html_out: Optional[str] = None,
 ) -> PipelineResult:
     log("[1/5] Fetch base route from Tmap")
     raw, base_route = fetch_tmap_route(start_lat, start_lon, end_lat, end_lon, app_key=app_key)
@@ -894,7 +894,7 @@ def run_cli(
     cctv_xlsx: str = CCTV_XLSX,
     streetlight_path: str = STREETLIGHT_PATH,
     police_path: str = POLICE_PATH,
-    model: str | None = MODEL_PATH,
+    model: Optional[str] = MODEL_PATH,
     alpha: float = ALPHA,
     hour: Any = HOUR_DEFAULT,
     out_json: str = OUT_JSON,
@@ -983,6 +983,7 @@ if __name__ == "__main__":
         out_html=MAIN_OUT_HTML,
         visualize=MAIN_VISUALIZE,
     )
+
 
 
 
